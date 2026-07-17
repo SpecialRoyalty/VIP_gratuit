@@ -206,3 +206,6 @@ Lorsqu'un groupe est détecté :
 5. le choix PUB/VIP n'est accepté qu'après une vérification réussie.
 
 Le bouton **🩺 ÉTAT DU BOT** détaille maintenant chaque groupe PUB et VIP : droits administrateur, droit de créer des liens et association au VIP. Il affiche aussi les campagnes actives, les VIP actifs et les invitations validées dans la journée.
+
+## Correction V5 — ajout puis promotion du bot
+Telegram envoie généralement deux événements distincts : ajout du bot comme membre, puis promotion comme administrateur. Le bot ne quitte plus le groupe au premier événement. Il reste en attente, puis l'administrateur utilise « Vérifier à nouveau » après la promotion. Le bot ne quitte désormais le groupe que lorsque « Refuser le groupe » est utilisé.
