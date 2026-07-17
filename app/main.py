@@ -22,7 +22,7 @@ from telegram.ext import (
 
 from .config import settings
 from .db import SessionLocal, init_db
-from .keyboards import admin_menu, group_role_keyboard, proof_menu, proof_review_keyboard, start_menu, user_menu
+from .keyboards import admin_menu, group_role_keyboard, proof_menu, proof_review_keyboard, start_menu, user_menu, group_manage_keyboard, groups_list_keyboard, vip_choice_keyboard, promote_required_keyboard
 from .models import Admin, Campaign, CampaignStatus, Group, GroupRole, Invite, InviteStatus, Proof, ProofStatus, Reminder, User
 from .texts import publication_text
 
@@ -30,6 +30,25 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name
 log = logging.getLogger(__name__)
 UTC = timezone.utc
 ACTIVE_STATUSES = (CampaignStatus.awaiting_proof, CampaignStatus.proof_review, CampaignStatus.active, CampaignStatus.vip_active)
+
+
+
+async def bot_admin_check(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> tuple[bool, str]:
+    """Vérifie que le bot est administrateur et possède les droits essentiels."""
+    try:
+        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+    except TelegramError as exc:
+        return False, f'inaccessible ({exc})'
+    if member.status == ChatMember.OWNER:
+        return True, 'propriétaire'
+    if member.status != ChatMember.ADMINISTRATOR:
+        return False, 'le bot n’est pas administrateur'
+    missing = []
+    if not getattr(member, 'can_invite_users', False):
+        missing.append('inviter via des liens')
+    if missing:
+        return False, 'droit manquant : ' + ', '.join(missing)
+    return True, 'administrateur, liens d’invitation autorisés'
 
 
 def now() -> datetime:
@@ -262,88 +281,169 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; data = q.data
     if data == 'a:health':
-        telegram_ok = False
-        database_ok = False
+        telegram_ok = database_ok = False
         bot_name = 'inconnu'
-        vip_groups = []
-        pub_groups = []
-        linked_pub_count = 0
-        vip_checks = []
-
         try:
-            me = await context.bot.get_me()
-            telegram_ok = True
+            me = await context.bot.get_me(); telegram_ok = True
             bot_name = f'@{me.username}' if me.username else me.full_name
         except TelegramError as exc:
             log.warning('Health Telegram échoué: %s', exc)
 
+        groups = []
+        active_campaigns = vip_active = valid_today = 0
         try:
             async with SessionLocal() as s:
-                await s.scalar(select(func.count()).select_from(User))
-                database_ok = True
-                vip_groups = (await s.scalars(
-                    select(Group).where(Group.role == GroupRole.vip, Group.authorized.is_(True))
-                )).all()
-                pub_groups = (await s.scalars(
-                    select(Group).where(Group.role == GroupRole.pub, Group.authorized.is_(True))
-                )).all()
-                linked_pub_count = sum(1 for group in pub_groups if group.vip_group_id is not None)
+                await s.scalar(select(func.count()).select_from(User)); database_ok = True
+                groups = (await s.scalars(select(Group).where(Group.authorized.is_(True)).order_by(Group.role, Group.title))).all()
+                active_campaigns = await s.scalar(select(func.count()).select_from(Campaign).where(Campaign.status.in_(ACTIVE_STATUSES))) or 0
+                vip_active = await s.scalar(select(func.count()).select_from(Campaign).where(Campaign.status == CampaignStatus.vip_active)) or 0
+                day_start = now().replace(hour=0, minute=0, second=0, microsecond=0)
+                valid_today = await s.scalar(select(func.count()).select_from(Invite).where(Invite.status == InviteStatus.valid, Invite.validated_at >= day_start)) or 0
         except Exception as exc:
             log.exception('Health PostgreSQL échoué: %s', exc)
 
-        for vip in vip_groups:
-            reachable = False
-            admin_rights = False
-            detail = ''
-            try:
-                chat = await context.bot.get_chat(vip.chat_id)
-                reachable = True
-                member = await context.bot.get_chat_member(vip.chat_id, context.bot.id)
-                admin_rights = member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
-                detail = chat.title or vip.title
-            except TelegramError:
-                detail = vip.title
-            vip_checks.append((detail, reachable, admin_rights))
+        pub_groups = [g for g in groups if g.role == GroupRole.pub]
+        vip_groups = [g for g in groups if g.role == GroupRole.vip]
+        checks = {}
+        for g in pub_groups + vip_groups:
+            checks[g.chat_id] = await bot_admin_check(context, g.chat_id)
 
-        vip_exists = bool(vip_groups)
-        vip_reachable = any(item[1] for item in vip_checks)
-        vip_admin = any(item[2] for item in vip_checks)
-        all_pubs_linked = bool(pub_groups) and linked_pub_count == len(pub_groups)
-        overall = telegram_ok and database_ok and vip_exists and vip_reachable and vip_admin
-
+        all_pub_admin = bool(pub_groups) and all(checks[g.chat_id][0] for g in pub_groups)
+        all_pub_linked = bool(pub_groups) and all(g.vip_group_id for g in pub_groups)
+        vip_ok = bool(vip_groups) and any(checks[g.chat_id][0] for g in vip_groups)
+        overall = telegram_ok and database_ok and vip_ok and all_pub_admin and all_pub_linked
         lines = [
-            f"{'✅' if overall else '⚠️'} <b>État du bot</b>",
-            '',
-            f"{'✅' if telegram_ok else '❌'} Telegram : {'connecté' if telegram_ok else 'indisponible'} ({bot_name})",
-            f"{'✅' if database_ok else '❌'} PostgreSQL : {'connectée' if database_ok else 'indisponible'}",
-            f"{'✅' if vip_exists else '❌'} Groupe VIP configuré : {len(vip_groups)}",
-            f"{'✅' if vip_reachable else '❌'} VIP accessible par le bot",
-            f"{'✅' if vip_admin else '❌'} Bot administrateur du VIP",
-            f"{'✅' if pub_groups else '⚠️'} Groupes PUB autorisés : {len(pub_groups)}",
-            f"{'✅' if all_pubs_linked else '⚠️'} Groupes PUB associés à un VIP : {linked_pub_count}/{len(pub_groups)}",
+            f"{'✅' if overall else '⚠️'} <b>État du système</b>", '',
+            '<b>Infrastructure</b>',
+            f"{'🟢' if telegram_ok else '🔴'} Telegram : {'connecté' if telegram_ok else 'indisponible'} ({bot_name})",
+            f"{'🟢' if database_ok else '🔴'} PostgreSQL : {'connectée' if database_ok else 'indisponible'}", '',
+            '<b>Groupes PUB</b>'
         ]
-        if vip_checks:
-            lines.append('')
-            lines.append('<b>VIP détecté(s)</b>')
-            for title, reachable, admin_rights in vip_checks:
-                lines.append(
-                    f"• {title} — {'accessible' if reachable else 'inaccessible'}, "
-                    f"{'admin' if admin_rights else 'droits insuffisants'}"
-                )
-        if not overall:
-            lines.extend(['', 'Utilise « GROUPES » pour vérifier le rôle des groupes et leur autorisation.'])
+        if not pub_groups:
+            lines.append('⚠️ Aucun groupe publicitaire configuré')
+        for g in pub_groups:
+            ok, detail = checks[g.chat_id]
+            linked = bool(g.vip_group_id)
+            lines.extend([
+                f"{'🟢' if ok and linked else '🔴'} {g.title}",
+                f"  Admin : {'Oui' if ok else 'Non'} — {detail}",
+                f"  VIP associé : {'Oui' if linked else 'Non'}",
+            ])
+        lines.extend(['', '<b>VIP</b>'])
+        if not vip_groups:
+            lines.append('🔴 Aucun groupe VIP configuré')
+        for g in vip_groups:
+            ok, detail = checks[g.chat_id]
+            lines.extend([f"{'🟢' if ok else '🔴'} {g.title}", f"  Bot admin : {'Oui' if ok else 'Non'} — {detail}"])
+        lines.extend([
+            '', '<b>Tâches automatiques</b>',
+            '🟢 Vérification des invitations après 5 minutes',
+            '🟢 Rappels avant expiration',
+            '🟢 Expiration et retrait VIP',
+            '', '<b>Activité</b>',
+            f'Campagnes actives : {active_campaigns}',
+            f'VIP actifs : {vip_active}',
+            f'Invitations validées aujourd’hui : {valid_today}',
+        ])
         await q.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=admin_menu())
+    elif data == 'a:menu':
+        await q.message.reply_text('🛠 Panneau administrateur', reply_markup=admin_menu())
     elif data == 'a:groups':
         async with SessionLocal() as s:
-            groups = (await s.scalars(select(Group).order_by(Group.created_at.desc()).limit(20))).all()
+            groups = (await s.scalars(select(Group).order_by(Group.created_at.desc()).limit(50))).all()
         if not groups: await q.message.reply_text('Aucun groupe détecté.'); return
-        for g in groups:
-            await q.message.reply_text(f'{g.title}\nID : <code>{g.chat_id}</code>\nRôle : {g.role.value}\nAutorisé : {g.authorized}', parse_mode=ParseMode.HTML, reply_markup=group_role_keyboard(g.chat_id) if g.role == GroupRole.pending else None)
+        await q.message.reply_text('👥 <b>Choisis un groupe à configurer</b>', parse_mode=ParseMode.HTML, reply_markup=groups_list_keyboard(groups))
+    elif data.startswith('a:group:'):
+        gid = int(data.split(':')[2])
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+            vip = await s.get(Group, g.vip_group_id) if g and g.vip_group_id else None
+        if not g:
+            await q.message.reply_text('Groupe introuvable.'); return
+        admin_ok, admin_detail = await bot_admin_check(context, g.chat_id)
+        status = (
+            f'⚙️ <b>{g.title}</b>\n\n'
+            f'ID : <code>{g.chat_id}</code>\n'
+            f'Rôle : {g.role.value}\n'
+            f'Bot administrateur : {"✅" if admin_ok else "❌"} ({admin_detail})\n'
+            f'Texte de pub : {"✅" if g.ad_text else "❌"}\n'
+            f'Image de pub : {"✅" if g.ad_photo_file_id else "❌"}\n'
+            f'Texte privé : {"✅" if g.private_intro else "❌"}\n'
+            f'Image privée : {"✅" if g.private_photo_file_id else "❌"}\n'
+            f'VIP associé : {vip.title if vip else "❌ Aucun"}'
+        )
+        markup = group_manage_keyboard(g.chat_id, g.role.value) if g.role != GroupRole.pending else group_role_keyboard(g.chat_id)
+        await q.message.reply_text(status, parse_mode=ParseMode.HTML, reply_markup=markup)
+    elif data.startswith('a:cfg:'):
+        _, _, gid_s, action = data.split(':', 3); gid = int(gid_s)
+        if action in ('ad_text', 'private_text'):
+            context.user_data['admin_input'] = {'group_id': gid, 'kind': action}
+            label = 'texte de publicité' if action == 'ad_text' else 'texte affiché en privé au démarrage'
+            await q.message.reply_text(f'✍️ Envoie maintenant le {label} dans ton prochain message.\n\nUtilise /annuler pour abandonner.')
+        elif action in ('ad_photo', 'private_photo'):
+            context.user_data['admin_input'] = {'group_id': gid, 'kind': action}
+            label = 'image de publicité' if action == 'ad_photo' else 'image affichée en privé au démarrage'
+            await q.message.reply_text(f'🖼 Envoie maintenant la {label} sous forme de photo.\n\nUtilise /annuler pour abandonner.')
+        elif action == 'vip':
+            async with SessionLocal() as s:
+                vips = (await s.scalars(select(Group).where(Group.role == GroupRole.vip, Group.authorized.is_(True)))).all()
+            if not vips:
+                await q.message.reply_text('Aucun groupe VIP configuré. Déclare d’abord un groupe comme VIP.'); return
+            await q.message.reply_text('Choisis le VIP commun à associer à ce groupe publicitaire :', reply_markup=vip_choice_keyboard(gid, vips))
+        elif action in ('preview', 'publish'):
+            async with SessionLocal() as s:
+                g = await s.get(Group, gid)
+            if not g:
+                await q.message.reply_text('Groupe introuvable.'); return
+            me = await context.bot.get_me(); url = f'https://t.me/{me.username}?start=pub_{g.source_token}'
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton('🎁 VIP GRATUIT', url=url)]])
+            target = q.from_user.id if action == 'preview' else g.chat_id
+            try:
+                if g.ad_photo_file_id:
+                    await context.bot.send_photo(target, g.ad_photo_file_id, caption=g.ad_text or 'Débloque ton VIP gratuit.', reply_markup=kb)
+                else:
+                    await context.bot.send_message(target, g.ad_text or 'Débloque ton VIP gratuit.', reply_markup=kb)
+                await q.message.reply_text('✅ Prévisualisation envoyée.' if action == 'preview' else '✅ Publicité publiée dans ce groupe.')
+            except TelegramError as exc:
+                await q.message.reply_text(f'❌ Envoi impossible : {exc}')
+    elif data.startswith('a:setvip:'):
+        _, _, pub_s, vip_s = data.split(':'); pub_id = int(pub_s); vip_id = int(vip_s)
+        async with SessionLocal() as s:
+            pub = await s.get(Group, pub_id); vip = await s.get(Group, vip_id)
+            if not pub or not vip or vip.role != GroupRole.vip:
+                await q.message.reply_text('Association invalide.'); return
+            pub.vip_group_id = vip_id; await s.commit()
+        await q.message.reply_text('✅ Groupe VIP associé.', reply_markup=group_manage_keyboard(pub_id, 'pub'))
+    elif data.startswith('a:recheck:'):
+        gid = int(data.split(':')[2])
+        ok, detail = await bot_admin_check(context, gid)
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+        if not g:
+            await q.message.reply_text('Groupe introuvable.'); return
+        if ok:
+            await q.message.reply_text(
+                f'✅ <b>{g.title}</b>\n\nLe bot est bien administrateur et peut gérer les liens d’invitation.\nChoisis maintenant le rôle du groupe :',
+                parse_mode=ParseMode.HTML, reply_markup=group_role_keyboard(gid))
+        else:
+            await q.message.reply_text(
+                f'❌ <b>Configuration impossible</b>\n\n{g.title}\n{detail}.\n\nPromue le bot administrateur avec le droit d’inviter des utilisateurs, puis appuie sur « Vérifier à nouveau ».',
+                parse_mode=ParseMode.HTML, reply_markup=promote_required_keyboard(gid))
     elif data.startswith('a:role:'):
         _, _, gid_s, role_s = data.split(':'); gid = int(gid_s); role = GroupRole(role_s)
+        if role != GroupRole.blocked:
+            ok, detail = await bot_admin_check(context, gid)
+            if not ok:
+                await q.message.reply_text(
+                    f'❌ Impossible d’enregistrer ce groupe : {detail}.\n\nPromue le bot administrateur avec le droit d’inviter des utilisateurs.',
+                    reply_markup=promote_required_keyboard(gid))
+                return
         async with SessionLocal() as s:
-            g = await s.get(Group, gid); g.role = role; g.authorized = role != GroupRole.blocked; await s.commit()
-        await q.message.reply_text(f'✅ Groupe configuré comme {role.value}.')
+            g = await s.get(Group, gid)
+            if not g:
+                await q.message.reply_text('Groupe introuvable.'); return
+            g.role = role; g.authorized = role != GroupRole.blocked; await s.commit()
+        await q.message.reply_text(f'✅ Groupe configuré comme {role.value}.', reply_markup=admin_menu())
     elif data == 'a:proofs':
         async with SessionLocal() as s:
             proofs = (await s.scalars(select(Proof).where(Proof.status == ProofStatus.pending).order_by(Proof.created_at).limit(10))).all()
@@ -386,11 +486,50 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await q.message.reply_text(f'📢 Publication envoyée dans {sent} groupe(s).')
 
 
+async def admin_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or update.effective_chat.type != ChatType.PRIVATE or not update.message.text:
+        return
+    if not await is_admin(update.effective_user.id):
+        return
+    pending = context.user_data.get('admin_input')
+    if not pending:
+        return
+    if update.message.text.strip().lower() == '/annuler':
+        context.user_data.pop('admin_input', None)
+        await update.message.reply_text('Configuration annulée.', reply_markup=admin_menu())
+        return
+    if pending['kind'] not in ('ad_text', 'private_text'):
+        await update.message.reply_text('Une image est attendue, pas un texte.')
+        return
+    async with SessionLocal() as s:
+        g = await s.get(Group, pending['group_id'])
+        if not g:
+            await update.message.reply_text('Groupe introuvable.'); context.user_data.pop('admin_input', None); return
+        if pending['kind'] == 'ad_text': g.ad_text = update.message.text
+        else: g.private_intro = update.message.text
+        await s.commit()
+    context.user_data.pop('admin_input', None)
+    await update.message.reply_text('✅ Texte enregistré.', reply_markup=group_manage_keyboard(g.chat_id, g.role.value))
+
+
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or update.effective_chat.type != ChatType.PRIVATE or not update.message.photo:
         return
-    if await is_admin(update.effective_user.id) and (update.message.caption or '').startswith(('#ad ', '#private ')):
-        await admin_photo_config(update, context); return
+    if await is_admin(update.effective_user.id):
+        pending = context.user_data.get('admin_input')
+        if pending and pending.get('kind') in ('ad_photo', 'private_photo'):
+            async with SessionLocal() as s:
+                g = await s.get(Group, pending['group_id'])
+                if not g:
+                    await update.message.reply_text('Groupe introuvable.'); context.user_data.pop('admin_input', None); return
+                if pending['kind'] == 'ad_photo': g.ad_photo_file_id = update.message.photo[-1].file_id
+                else: g.private_photo_file_id = update.message.photo[-1].file_id
+                await s.commit()
+            context.user_data.pop('admin_input', None)
+            await update.message.reply_text('✅ Image enregistrée.', reply_markup=group_manage_keyboard(g.chat_id, g.role.value))
+            return
+        if (update.message.caption or '').startswith(('#ad ', '#private ')):
+            await admin_photo_config(update, context); return
     camp = await active_campaign(update.effective_user.id)
     if not camp or camp.status not in (CampaignStatus.awaiting_proof, CampaignStatus.proof_review):
         await update.message.reply_text('Aucune preuve attendue.'); return
@@ -444,9 +583,19 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 except TelegramError:
                     pass
         except TelegramError: pass
+        admin_ok, detail = await bot_admin_check(context, chat.id)
         for oid in settings.owner_ids:
-            try: await context.bot.send_message(oid, f'✅ Groupe détecté : {chat.title}\nID : <code>{chat.id}</code>\nChoisis son rôle :', parse_mode=ParseMode.HTML, reply_markup=group_role_keyboard(chat.id))
-            except TelegramError: pass
+            try:
+                if admin_ok:
+                    await context.bot.send_message(
+                        oid, f'✅ <b>Nouveau groupe détecté</b>\n\nNom : {chat.title}\nID : <code>{chat.id}</code>\nBot administrateur : 🟢 Oui\n\nQuel est son rôle ?',
+                        parse_mode=ParseMode.HTML, reply_markup=group_role_keyboard(chat.id))
+                else:
+                    await context.bot.send_message(
+                        oid, f'❌ <b>Configuration impossible</b>\n\nNom : {chat.title}\nID : <code>{chat.id}</code>\nÉtat : {detail}\n\nPromue le bot administrateur avec le droit d’inviter des utilisateurs, puis vérifie à nouveau.',
+                        parse_mode=ParseMode.HTML, reply_markup=promote_required_keyboard(chat.id))
+            except TelegramError:
+                pass
     else:
         for oid in settings.owner_ids:
             try: await context.bot.send_message(oid, f'🚨 Tentative de raccordement non autorisée\nGroupe : {chat.title}\nID : <code>{chat.id}</code>\nAjouté par : {actor.id}', parse_mode=ParseMode.HTML)
@@ -568,6 +717,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler('admin', admin_cmd))
     app.add_handler(CommandHandler(['setad', 'setintro', 'linkvip'], configure_cmd))
     app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text_input))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
     app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(chat_member, ChatMemberHandler.CHAT_MEMBER))
