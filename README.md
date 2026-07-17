@@ -7,7 +7,7 @@ Projet Python prêt à déployer sur Railway. Il utilise `python-telegram-bot`, 
 - Détection des groupes dans lesquels le bot est ajouté.
 - Alerte et sortie automatique lors d’un raccordement non autorisé.
 - Détection des administrateurs Telegram après raccordement autorisé.
-- Classement des groupes en `pub` ou `VIP` depuis le panneau `/admin`.
+- Classement des groupes en `pub` ou `VIP` depuis le panneau `/start` (le panneau admin s’ouvre automatiquement pour un administrateur détecté).
 - Publicité différente par groupe avec image, texte et bouton `VIP GRATUIT`.
 - Mémorisation du premier groupe publicitaire utilisé.
 - Une seule campagne active par utilisateur, y compris lorsqu’il clique depuis plusieurs groupes.
@@ -78,7 +78,7 @@ Après l’ajout autorisé, le propriétaire reçoit un message privé avec les 
 - `GROUPE VIP` ;
 - `REFUSER`.
 
-Lance ensuite `/admin` en privé pour retrouver les groupes et les preuves.
+Lance ensuite `/start` (le panneau admin s’ouvre automatiquement pour un administrateur détecté) en privé pour retrouver les groupes et les preuves.
 
 ### Associer un groupe pub au VIP
 
@@ -122,7 +122,7 @@ ou :
 
 ### Publier les publicités
 
-Dans `/admin`, utilise le bouton `PUBLIER LES PUBS`. Le bot publie dans chaque groupe publicitaire configuré son image, son texte et le bouton `VIP GRATUIT`.
+Dans `/start` (le panneau admin s’ouvre automatiquement pour un administrateur détecté), utilise le bouton `PUBLIER LES PUBS`. Le bot publie dans chaque groupe publicitaire configuré son image, son texte et le bouton `VIP GRATUIT`.
 
 ## 5. Validation des captures
 
@@ -184,3 +184,11 @@ Procfile
 railway.json
 .env.example
 ```
+
+
+## Détection automatique des administrateurs et état du bot
+
+- Les propriétaires définis dans `OWNER_IDS` sont administrateurs dès le démarrage.
+- Lorsqu’un groupe est raccordé par un administrateur autorisé, les administrateurs Telegram de ce groupe sont enregistrés automatiquement.
+- En conversation privée, `/start` ouvre directement le panneau administrateur pour ces comptes. La commande `/admin` reste disponible comme raccourci facultatif.
+- Le bouton **🩺 ÉTAT DU BOT** contrôle la connexion Telegram, PostgreSQL, l’existence du VIP, l’accès du bot au VIP, ses droits administrateur et l’association des groupes PUB au VIP.
