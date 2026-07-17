@@ -192,3 +192,17 @@ railway.json
 - Lorsqu’un groupe est raccordé par un administrateur autorisé, les administrateurs Telegram de ce groupe sont enregistrés automatiquement.
 - En conversation privée, `/start` ouvre directement le panneau administrateur pour ces comptes. La commande `/admin` reste disponible comme raccourci facultatif.
 - Le bouton **🩺 ÉTAT DU BOT** contrôle la connexion Telegram, PostgreSQL, l’existence du VIP, l’accès du bot au VIP, ses droits administrateur et l’association des groupes PUB au VIP.
+
+## Vérification obligatoire des droits administrateur (V4)
+
+Le bot refuse désormais d'enregistrer un groupe PUB ou VIP tant qu'il n'est pas administrateur de ce groupe avec le droit **Inviter des utilisateurs / gérer les liens d'invitation**.
+
+Lorsqu'un groupe est détecté :
+
+1. le bot vérifie immédiatement ses droits ;
+2. s'il n'est pas administrateur, le panneau affiche **Configuration impossible** ;
+3. l'administrateur Telegram doit promouvoir le bot ;
+4. le bouton **🔄 VÉRIFIER À NOUVEAU** relance le contrôle ;
+5. le choix PUB/VIP n'est accepté qu'après une vérification réussie.
+
+Le bouton **🩺 ÉTAT DU BOT** détaille maintenant chaque groupe PUB et VIP : droits administrateur, droit de créer des liens et association au VIP. Il affiche aussi les campagnes actives, les VIP actifs et les invitations validées dans la journée.
