@@ -78,6 +78,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await upsert_user(update.effective_user)
     if not context.args:
+        # Les administrateurs sont détectés automatiquement : /start ouvre directement
+        # leur panneau, sans devoir connaître ou saisir la commande /admin.
+        if await is_admin(update.effective_user.id):
+            await update.message.reply_text(
+                '🛠 <b>Panneau administrateur</b>\n\n'
+                'Ton compte administrateur a été détecté automatiquement.',
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_menu(),
+            )
+            return
         camp = await active_campaign(update.effective_user.id)
         if camp:
             await update.message.reply_text('🏠 Menu principal', reply_markup=user_menu())
@@ -251,7 +261,79 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query; data = q.data
-    if data == 'a:groups':
+    if data == 'a:health':
+        telegram_ok = False
+        database_ok = False
+        bot_name = 'inconnu'
+        vip_groups = []
+        pub_groups = []
+        linked_pub_count = 0
+        vip_checks = []
+
+        try:
+            me = await context.bot.get_me()
+            telegram_ok = True
+            bot_name = f'@{me.username}' if me.username else me.full_name
+        except TelegramError as exc:
+            log.warning('Health Telegram échoué: %s', exc)
+
+        try:
+            async with SessionLocal() as s:
+                await s.scalar(select(func.count()).select_from(User))
+                database_ok = True
+                vip_groups = (await s.scalars(
+                    select(Group).where(Group.role == GroupRole.vip, Group.authorized.is_(True))
+                )).all()
+                pub_groups = (await s.scalars(
+                    select(Group).where(Group.role == GroupRole.pub, Group.authorized.is_(True))
+                )).all()
+                linked_pub_count = sum(1 for group in pub_groups if group.vip_group_id is not None)
+        except Exception as exc:
+            log.exception('Health PostgreSQL échoué: %s', exc)
+
+        for vip in vip_groups:
+            reachable = False
+            admin_rights = False
+            detail = ''
+            try:
+                chat = await context.bot.get_chat(vip.chat_id)
+                reachable = True
+                member = await context.bot.get_chat_member(vip.chat_id, context.bot.id)
+                admin_rights = member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
+                detail = chat.title or vip.title
+            except TelegramError:
+                detail = vip.title
+            vip_checks.append((detail, reachable, admin_rights))
+
+        vip_exists = bool(vip_groups)
+        vip_reachable = any(item[1] for item in vip_checks)
+        vip_admin = any(item[2] for item in vip_checks)
+        all_pubs_linked = bool(pub_groups) and linked_pub_count == len(pub_groups)
+        overall = telegram_ok and database_ok and vip_exists and vip_reachable and vip_admin
+
+        lines = [
+            f"{'✅' if overall else '⚠️'} <b>État du bot</b>",
+            '',
+            f"{'✅' if telegram_ok else '❌'} Telegram : {'connecté' if telegram_ok else 'indisponible'} ({bot_name})",
+            f"{'✅' if database_ok else '❌'} PostgreSQL : {'connectée' if database_ok else 'indisponible'}",
+            f"{'✅' if vip_exists else '❌'} Groupe VIP configuré : {len(vip_groups)}",
+            f"{'✅' if vip_reachable else '❌'} VIP accessible par le bot",
+            f"{'✅' if vip_admin else '❌'} Bot administrateur du VIP",
+            f"{'✅' if pub_groups else '⚠️'} Groupes PUB autorisés : {len(pub_groups)}",
+            f"{'✅' if all_pubs_linked else '⚠️'} Groupes PUB associés à un VIP : {linked_pub_count}/{len(pub_groups)}",
+        ]
+        if vip_checks:
+            lines.append('')
+            lines.append('<b>VIP détecté(s)</b>')
+            for title, reachable, admin_rights in vip_checks:
+                lines.append(
+                    f"• {title} — {'accessible' if reachable else 'inaccessible'}, "
+                    f"{'admin' if admin_rights else 'droits insuffisants'}"
+                )
+        if not overall:
+            lines.extend(['', 'Utilise « GROUPES » pour vérifier le rôle des groupes et leur autorisation.'])
+        await q.message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML, reply_markup=admin_menu())
+    elif data == 'a:groups':
         async with SessionLocal() as s:
             groups = (await s.scalars(select(Group).order_by(Group.created_at.desc()).limit(20))).all()
         if not groups: await q.message.reply_text('Aucun groupe détecté.'); return
@@ -341,10 +423,26 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Detect group admins as panel admins, but only after an authorized connection.
         try:
             admins = await context.bot.get_chat_administrators(chat.id)
+            newly_detected = []
             async with SessionLocal() as s:
                 for member in admins:
-                    if not member.user.is_bot and not await s.get(Admin, member.user.id): s.add(Admin(telegram_id=member.user.id, source='group_admin'))
+                    if member.user.is_bot:
+                        continue
+                    if not await s.get(Admin, member.user.id):
+                        s.add(Admin(telegram_id=member.user.id, source='group_admin'))
+                        newly_detected.append(member.user.id)
                 await s.commit()
+            # Telegram n'autorise un bot à écrire en privé qu'après que la personne
+            # a démarré le bot. On tente tout de même d'afficher automatiquement le panneau.
+            for admin_id in newly_detected:
+                try:
+                    await context.bot.send_message(
+                        admin_id,
+                        '🛠 Ton compte administrateur a été détecté automatiquement.',
+                        reply_markup=admin_menu(),
+                    )
+                except TelegramError:
+                    pass
         except TelegramError: pass
         for oid in settings.owner_ids:
             try: await context.bot.send_message(oid, f'✅ Groupe détecté : {chat.title}\nID : <code>{chat.id}</code>\nChoisis son rôle :', parse_mode=ParseMode.HTML, reply_markup=group_role_keyboard(chat.id))

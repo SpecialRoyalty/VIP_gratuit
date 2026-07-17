@@ -26,6 +26,7 @@ def proof_menu():
 
 def admin_menu():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton('🩺 ÉTAT DU BOT', callback_data='a:health')],
         [InlineKeyboardButton('👥 GROUPES', callback_data='a:groups'), InlineKeyboardButton('📸 PREUVES', callback_data='a:proofs')],
         [InlineKeyboardButton('📊 STATISTIQUES', callback_data='a:stats'), InlineKeyboardButton('📢 PUBLIER LES PUBS', callback_data='a:post_ads')],
     ])
