@@ -443,7 +443,18 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not g:
                 await q.message.reply_text('Groupe introuvable.'); return
             g.role = role; g.authorized = role != GroupRole.blocked; await s.commit()
-        await q.message.reply_text(f'✅ Groupe configuré comme {role.value}.', reply_markup=admin_menu())
+        if role == GroupRole.blocked:
+            try:
+                await context.bot.send_message(gid, '⚠️ Ce groupe a été refusé par un administrateur. Le bot va quitter le groupe.')
+            except TelegramError:
+                pass
+            try:
+                await context.bot.leave_chat(gid)
+            except TelegramError:
+                pass
+            await q.message.reply_text('✅ Groupe refusé et bot retiré.', reply_markup=admin_menu())
+        else:
+            await q.message.reply_text(f'✅ Groupe configuré comme {role.value}.', reply_markup=admin_menu())
     elif data == 'a:proofs':
         async with SessionLocal() as s:
             proofs = (await s.scalars(select(Proof).where(Proof.status == ProofStatus.pending).order_by(Proof.created_at).limit(10))).all()
@@ -558,8 +569,14 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             s.add(g)
         else: g.title = chat.title or g.title
         await s.commit()
-    if authorized_actor:
-        # Detect group admins as panel admins, but only after an authorized connection.
+    # IMPORTANT : Telegram envoie d'abord un événement lorsque le bot est ajouté
+    # comme simple membre, puis un second lorsqu'il est promu administrateur.
+    # Le bot ne doit donc jamais quitter immédiatement au premier événement.
+    # Le groupe reste en attente jusqu'à sa validation ou son refus depuis le panneau.
+    admin_ok, detail = await bot_admin_check(context, chat.id)
+
+    if admin_ok:
+        # Une fois le bot administrateur, détecter automatiquement les admins du groupe.
         try:
             admins = await context.bot.get_chat_administrators(chat.id)
             newly_detected = []
@@ -571,8 +588,6 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         s.add(Admin(telegram_id=member.user.id, source='group_admin'))
                         newly_detected.append(member.user.id)
                 await s.commit()
-            # Telegram n'autorise un bot à écrire en privé qu'après que la personne
-            # a démarré le bot. On tente tout de même d'afficher automatiquement le panneau.
             for admin_id in newly_detected:
                 try:
                     await context.bot.send_message(
@@ -582,26 +597,28 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     )
                 except TelegramError:
                     pass
-        except TelegramError: pass
-        admin_ok, detail = await bot_admin_check(context, chat.id)
-        for oid in settings.owner_ids:
-            try:
-                if admin_ok:
-                    await context.bot.send_message(
-                        oid, f'✅ <b>Nouveau groupe détecté</b>\n\nNom : {chat.title}\nID : <code>{chat.id}</code>\nBot administrateur : 🟢 Oui\n\nQuel est son rôle ?',
-                        parse_mode=ParseMode.HTML, reply_markup=group_role_keyboard(chat.id))
-                else:
-                    await context.bot.send_message(
-                        oid, f'❌ <b>Configuration impossible</b>\n\nNom : {chat.title}\nID : <code>{chat.id}</code>\nÉtat : {detail}\n\nPromue le bot administrateur avec le droit d’inviter des utilisateurs, puis vérifie à nouveau.',
-                        parse_mode=ParseMode.HTML, reply_markup=promote_required_keyboard(chat.id))
-            except TelegramError:
-                pass
-    else:
-        for oid in settings.owner_ids:
-            try: await context.bot.send_message(oid, f'🚨 Tentative de raccordement non autorisée\nGroupe : {chat.title}\nID : <code>{chat.id}</code>\nAjouté par : {actor.id}', parse_mode=ParseMode.HTML)
-            except TelegramError: pass
-        try: await context.bot.send_message(chat.id, '⚠️ Ce groupe n’est pas autorisé à utiliser ce bot. Le bot va quitter ce groupe.'); await context.bot.leave_chat(chat.id)
-        except TelegramError: pass
+        except TelegramError:
+            pass
+
+    for oid in settings.owner_ids:
+        try:
+            if admin_ok:
+                await context.bot.send_message(
+                    oid,
+                    f'✅ <b>Nouveau groupe détecté</b>\n\nNom : {chat.title}\nID : <code>{chat.id}</code>\nBot administrateur : 🟢 Oui\n\nQuel est son rôle ?',
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=group_role_keyboard(chat.id),
+                )
+            else:
+                warning = '' if authorized_actor else '\n\n⚠️ La personne ayant ajouté le bot n’est pas encore reconnue comme administrateur du panneau. Le groupe reste néanmoins en attente et le bot ne le quittera pas automatiquement.'
+                await context.bot.send_message(
+                    oid,
+                    f'⏳ <b>Groupe en attente de configuration</b>\n\nNom : {chat.title}\nID : <code>{chat.id}</code>\nÉtat : {detail}{warning}\n\nPromue le bot administrateur avec le droit d’inviter des utilisateurs, puis appuie sur « Vérifier à nouveau ».',
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=promote_required_keyboard(chat.id),
+                )
+        except TelegramError:
+            pass
 
 
 async def chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
