@@ -1,0 +1,546 @@
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
+
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatType, ParseMode
+from telegram.error import TelegramError
+from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+from .config import settings
+from .db import SessionLocal, engine, init_db
+from .keyboards import admin_menu, choose_vip, group_list, manage_pub, pending_group, start_campaign, user_menu, vip_confirm
+from .models import Admin, Campaign, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, User, VipSession, VipSessionStatus
+from .services import active_campaign, active_session, bot_rights, ensure_user, forbidden_match, is_admin, now, public_group_link, record, remaining_minutes, token
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+log = logging.getLogger('vip-minutes-bot')
+
+
+async def notify_admins(bot, text: str, markup=None) -> None:
+    async with SessionLocal() as s:
+        ids = set(settings.owner_ids) | set((await s.scalars(select(Admin.telegram_id).where(Admin.active.is_(True)))).all())
+    for uid in ids:
+        try:
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
+        except TelegramError:
+            pass
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    user = await ensure_user(update.effective_user)
+    if await is_admin(user.telegram_id) and not context.args:
+        await update.message.reply_text('🛠 <b>Panneau administrateur</b>', parse_mode=ParseMode.HTML, reply_markup=admin_menu())
+        return
+    if user.banned:
+        await update.message.reply_text('⛔ Tu n’as pas invité des personnes FR valides. Tu es banni.')
+        return
+    if context.args and context.args[0].startswith('pub_'):
+        source = context.args[0][4:]
+        async with SessionLocal() as s:
+            group = await s.scalar(select(Group).where(Group.source_token == source, Group.role == GroupRole.pub, Group.authorized.is_(True)))
+            if group:
+                s.add(MetricEvent(event_type=EventType.ad_click, pub_group_id=group.chat_id, ad_version=group.ad_version, user_id=user.telegram_id))
+                await s.commit()
+        current = await active_campaign(user.telegram_id)
+        session = await active_session(user.telegram_id)
+        if current:
+            await show_counter(update.effective_message, user.telegram_id)
+            return
+        if session:
+            await update.message.reply_text('⚠️ Tu as déjà un accès VIP ou un lien VIP actif. Une seule campagne est possible.')
+            return
+        if not group or not group.vip_group_id:
+            await update.message.reply_text('Cette publicité n’est pas correctement reliée au VIP.')
+            return
+        context.user_data['source_group'] = group.chat_id
+        await update.message.reply_text(
+            '🚀 <b>Bienvenue !</b>\n\n'
+            'Invite des personnes avec ton lien personnel et gagne du temps dans le VIP.\n\n'
+            '⏱ <b>1 invitation validée = 1 minute de VIP.</b>\n'
+            f'Il faut au moins <b>{settings.minimum_minutes} minutes</b> pour démarrer un accès.\n\n'
+            'Tu peux partager ton lien où tu le souhaites, en respectant les règles des plateformes.',
+            parse_mode=ParseMode.HTML, reply_markup=start_campaign())
+        return
+    current = await active_campaign(user.telegram_id)
+    if current:
+        await show_counter(update.effective_message, user.telegram_id)
+    else:
+        await update.message.reply_text('Ouvre le bouton « 🎁 VIP GRATUIT » depuis un groupe publicitaire pour commencer.')
+
+
+async def show_counter(message, user_id: int) -> None:
+    camp = await active_campaign(user_id)
+    if not camp:
+        await message.reply_text('Aucune campagne active.')
+        return
+    rem = await remaining_minutes(camp)
+    session = await active_session(user_id)
+    status = 'Aucun accès actif'
+    if session and session.status == VipSessionStatus.active and session.expires_at:
+        seconds = max(0, int((session.expires_at - now()).total_seconds()))
+        status = f'VIP actif — environ {seconds // 60} min restantes'
+    missing = max(0, settings.minimum_minutes - rem)
+    text = (
+        '📊 <b>Ton compteur</b>\n\n'
+        f'✅ Invitations validées : <b>{camp.valid_invites}</b>\n'
+        f'⏳ En vérification : <b>{camp.pending_invites}</b>\n'
+        f'❌ Non validées : <b>{camp.invalid_invites}</b>\n\n'
+        f'⏱ Crédit disponible : <b>{rem} minute(s)</b>\n'
+        f'🔐 Statut : {status}'
+    )
+    if rem < settings.minimum_minutes:
+        text += f'\n\nIl te manque <b>{missing}</b> invitation(s) valide(s) pour générer un accès.'
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=user_menu(rem >= settings.minimum_minutes and not session, missing))
+
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ''
+    uid = q.from_user.id
+
+    if data.startswith('a:'):
+        if not await is_admin(uid):
+            await q.message.reply_text('Accès refusé.')
+            return
+        await admin_callback(q, context, data)
+        return
+
+    if data == 'u:rules':
+        await q.message.reply_text(
+            '📖 <b>Comment ça marche ?</b>\n\n'
+            '1️⃣ Le bot crée un lien vers le groupe PUB depuis lequel tu as commencé.\n'
+            '2️⃣ Chaque personne validée ajoute une minute à ton crédit.\n'
+            f'3️⃣ À partir de {settings.minimum_minutes} minutes, tu peux générer un lien VIP personnel.\n'
+            '4️⃣ Le temps commence seulement lorsque tu rejoins réellement le VIP.\n'
+            '5️⃣ Les nouvelles invitations validées pendant ton accès prolongent immédiatement sa durée.\n'
+            '6️⃣ À zéro minute, tu es automatiquement retiré du VIP.\n\n'
+            'Une seule campagne peut être active à la fois.', parse_mode=ParseMode.HTML)
+        return
+
+    if data == 'u:create':
+        group_id = context.user_data.get('source_group')
+        if not group_id:
+            await q.message.reply_text('Reviens depuis le bouton « VIP GRATUIT » du groupe PUB.')
+            return
+        if await active_campaign(uid):
+            await show_counter(q.message, uid); return
+        async with SessionLocal() as s:
+            user = await s.get(User, uid)
+            group = await s.get(Group, group_id)
+            if not user or user.banned or not group or not group.vip_group_id:
+                await q.message.reply_text('Impossible de démarrer cette campagne.'); return
+        ok, reason = await bot_rights(context.bot, group_id)
+        if not ok:
+            await q.message.reply_text(f'Le groupe PUB n’est pas opérationnel : {reason}.'); return
+        try:
+            link = await context.bot.create_chat_invite_link(group_id, name=f'parrain-{uid}'[:32])
+        except TelegramError as exc:
+            await q.message.reply_text(f'Création du lien impossible : {exc}'); return
+        async with SessionLocal() as s:
+            camp = Campaign(user_id=uid, pub_group_id=group_id, vip_group_id=group.vip_group_id, invite_link=link.invite_link)
+            s.add(camp)
+            s.add(MetricEvent(event_type=EventType.campaign_started, pub_group_id=group_id, ad_version=group.ad_version, user_id=uid))
+            await s.commit()
+        await q.message.reply_text(f'✅ <b>Ton lien personnel est prêt !</b>\n\n<code>{link.invite_link}</code>\n\nChaque invitation validée ajoute une minute.', parse_mode=ParseMode.HTML, reply_markup=user_menu(False, settings.minimum_minutes))
+        return
+
+    if data in ('u:counter', 'u:link'):
+        if data == 'u:link':
+            camp = await active_campaign(uid)
+            if camp:
+                await q.message.reply_text(f'🔗 <b>Ton lien personnel</b>\n\n<code>{camp.invite_link}</code>', parse_mode=ParseMode.HTML)
+            else:
+                await q.message.reply_text('Aucune campagne active.')
+        else:
+            await show_counter(q.message, uid)
+        return
+
+    if data == 'u:use':
+        camp = await active_campaign(uid)
+        if not camp:
+            await q.message.reply_text('Aucune campagne active.'); return
+        rem = await remaining_minutes(camp)
+        if rem < settings.minimum_minutes:
+            await q.message.reply_text(f'Il faut au moins {settings.minimum_minutes} minutes.'); return
+        if await active_session(uid):
+            await q.message.reply_text('Tu as déjà un lien ou une session VIP active.'); return
+        await q.message.reply_text(f'🔐 Utiliser ton crédit VIP ?\n\nCrédit disponible : <b>{rem} minutes</b>\nLe temps commencera à ton entrée réelle.', parse_mode=ParseMode.HTML, reply_markup=vip_confirm())
+        return
+
+    if data == 'u:confirmvip':
+        camp = await active_campaign(uid)
+        if not camp or await active_session(uid):
+            await q.message.reply_text('Accès déjà actif ou campagne absente.'); return
+        rem = await remaining_minutes(camp)
+        if rem < settings.minimum_minutes:
+            await q.message.reply_text('Crédit insuffisant.'); return
+        ok, reason = await bot_rights(context.bot, camp.vip_group_id)
+        if not ok:
+            await q.message.reply_text(f'VIP indisponible : {reason}. Les administrateurs ont été prévenus.')
+            await notify_admins(context.bot, f'🚨 <b>VIP indisponible</b>\n{reason}')
+            return
+        expiry = now() + timedelta(minutes=settings.vip_link_ttl_minutes)
+        try:
+            link = await context.bot.create_chat_invite_link(camp.vip_group_id, name=f'vip-{uid}'[:32], expire_date=expiry, member_limit=1)
+        except TelegramError as exc:
+            await q.message.reply_text(f'Impossible de créer le lien VIP : {exc}'); return
+        async with SessionLocal() as s:
+            session = VipSession(campaign_id=camp.id, user_id=uid, vip_group_id=camp.vip_group_id, invite_link=link.invite_link, invite_expires_at=expiry, allocated_minutes=rem)
+            s.add(session)
+            s.add(MetricEvent(event_type=EventType.vip_link, pub_group_id=camp.pub_group_id, user_id=uid))
+            await s.commit()
+        await q.message.reply_text(f'✅ Ton lien VIP personnel est prêt.\n\nIl est valable {settings.vip_link_ttl_minutes} minutes et utilisable une seule fois.', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🔐 REJOINDRE LE VIP', url=link.invite_link)]]))
+        return
+
+
+async def admin_callback(q, context, data: str) -> None:
+    if data in ('a:menu',):
+        await q.message.reply_text('🛠 Panneau administrateur', reply_markup=admin_menu()); return
+    if data == 'a:groups':
+        async with SessionLocal() as s:
+            groups = list((await s.scalars(select(Group).order_by(Group.title))).all())
+        await q.message.reply_text('👥 Groupes détectés', reply_markup=group_list(groups)); return
+    if data.startswith('a:g:'):
+        gid = int(data.split(':')[2])
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+        if not g: return
+        if g.role == GroupRole.pub:
+            await q.message.reply_text(f'📢 <b>{g.title}</b>\nTexte : {"✅" if g.ad_text else "❌"}\nImage : {"✅" if g.ad_photo_file_id else "❌"}\nVIP associé : {"✅" if g.vip_group_id else "❌"}', parse_mode=ParseMode.HTML, reply_markup=manage_pub(gid))
+        elif g.role == GroupRole.pending:
+            ok, reason = await bot_rights(context.bot, gid)
+            await q.message.reply_text(f'⏳ {g.title}\nDroits : {reason}', reply_markup=pending_group(gid, ok))
+        else:
+            await q.message.reply_text(f'🔐 VIP : {g.title}')
+        return
+    if data.startswith('a:check:'):
+        gid = int(data.split(':')[2]); ok, reason = await bot_rights(context.bot, gid)
+        await q.message.reply_text(f'{"✅" if ok else "❌"} {reason}', reply_markup=pending_group(gid, ok)); return
+    if data.startswith('a:role:'):
+        _, _, gid_s, role_s = data.split(':'); gid = int(gid_s)
+        ok, reason = await bot_rights(context.bot, gid)
+        if not ok:
+            await q.message.reply_text(f'Configuration impossible : {reason}'); return
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid); g.role = GroupRole(role_s); g.authorized = True; await s.commit()
+        await q.message.reply_text('✅ Rôle enregistré.', reply_markup=admin_menu()); return
+    if data.startswith('a:reject:'):
+        gid = int(data.split(':')[2])
+        try:
+            await context.bot.send_message(gid, 'Garde la pêche 👋')
+            await context.bot.leave_chat(gid)
+        except TelegramError:
+            pass
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+            if g: g.role = GroupRole.blocked; g.authorized = False; await s.commit()
+        await q.message.reply_text('Groupe refusé et bot débranché.'); return
+    if data.startswith('a:adtext:'):
+        gid = int(data.split(':')[2]); context.user_data['admin_input'] = ('ad_text', gid)
+        await q.message.reply_text('📝 Envoie maintenant le texte publicitaire de ce groupe.'); return
+    if data.startswith('a:adphoto:'):
+        gid = int(data.split(':')[2]); context.user_data['admin_input'] = ('ad_photo', gid)
+        await q.message.reply_text('🖼 Envoie maintenant l’image publicitaire de ce groupe.'); return
+    if data.startswith('a:choosevip:'):
+        pub_id = int(data.split(':')[2])
+        async with SessionLocal() as s:
+            vips = list((await s.scalars(select(Group).where(Group.role == GroupRole.vip, Group.authorized.is_(True)))).all())
+        await q.message.reply_text('Choisis le VIP associé :', reply_markup=choose_vip(pub_id, vips)); return
+    if data.startswith('a:setvip:'):
+        _, _, pub_s, vip_s = data.split(':'); pub_id, vip_id = int(pub_s), int(vip_s)
+        async with SessionLocal() as s:
+            g = await s.get(Group, pub_id); g.vip_group_id = vip_id; await s.commit()
+        await q.message.reply_text('✅ VIP associé.'); return
+    if data.startswith('a:preview:') or data.startswith('a:publish:'):
+        gid = int(data.split(':')[2])
+        async with SessionLocal() as s: g = await s.get(Group, gid)
+        if not g or not g.ad_text or not g.ad_photo_file_id:
+            await q.message.reply_text('Configure d’abord le texte et l’image.'); return
+        me = await context.bot.get_me()
+        url = f'https://t.me/{me.username}?start=pub_{g.source_token}'
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton('🎁 VIP GRATUIT', url=url)]])
+        target = q.message.chat_id if data.startswith('a:preview:') else gid
+        try:
+            await context.bot.send_photo(target, g.ad_photo_file_id, caption=g.ad_text, reply_markup=markup)
+            if target == gid:
+                await record(EventType.ad_published, pub_group_id=gid, ad_version=g.ad_version)
+                await q.message.reply_text('✅ Publicité publiée.')
+        except TelegramError as exc:
+            await q.message.reply_text(f'Publication impossible : {exc}')
+        return
+    if data.startswith('a:gstats:'):
+        gid = int(data.split(':')[2]); await send_group_stats(q.message, gid); return
+    if data == 'a:stats':
+        await send_global_stats(q.message); return
+    if data == 'a:health':
+        await send_health(q.message, context); return
+    if data == 'a:words':
+        async with SessionLocal() as s:
+            rows = list((await s.scalars(select(ForbiddenWord).where(ForbiddenWord.active.is_(True)))).all())
+        words = '\n'.join(f'• {x.word} ({"mot isolé" if x.exact_word else "contient"})' for x in rows) or 'Aucun mot configuré.'
+        context.user_data['admin_input'] = ('forbidden_word', 0)
+        await q.message.reply_text('🚫 <b>Mots interdits</b>\n\n' + words + '\n\nEnvoie un nouveau mot pour l’ajouter en mode « mot isolé ».', parse_mode=ParseMode.HTML)
+
+
+async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not await is_admin(update.effective_user.id):
+        return
+    action = context.user_data.get('admin_input')
+    if not action:
+        return
+    kind, gid = action
+    if kind == 'ad_text' and update.message.text:
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid); g.ad_text = update.message.text; g.ad_version += 1; await s.commit()
+        context.user_data.pop('admin_input', None)
+        await update.message.reply_text('✅ Texte enregistré.', reply_markup=manage_pub(gid))
+    elif kind == 'ad_photo' and update.message.photo:
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid); g.ad_photo_file_id = update.message.photo[-1].file_id; g.ad_version += 1; await s.commit()
+        context.user_data.pop('admin_input', None)
+        await update.message.reply_text('✅ Image enregistrée.', reply_markup=manage_pub(gid))
+    elif kind == 'forbidden_word' and update.message.text:
+        word = update.message.text.strip()
+        async with SessionLocal() as s:
+            if not await s.scalar(select(ForbiddenWord).where(func.lower(ForbiddenWord.word) == word.lower())):
+                s.add(ForbiddenWord(word=word, exact_word=True))
+                await s.commit()
+        context.user_data.pop('admin_input', None)
+        await update.message.reply_text('✅ Mot interdit ajouté.', reply_markup=admin_menu())
+
+
+async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cmu = update.my_chat_member
+    if not cmu or cmu.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    new = cmu.new_chat_member.status
+    old = cmu.old_chat_member.status
+    actor = cmu.from_user
+    chat = cmu.chat
+    if new in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR) and old in (ChatMember.LEFT, ChatMember.BANNED):
+        trusted = await is_admin(actor.id)
+        if not trusted:
+            link = await public_group_link(context.bot, chat)
+            await notify_admins(context.bot, f'🚨 <b>Tentative de raccordement non autorisée</b>\n\nGroupe : {chat.title}\nAjouté par : @{actor.username or actor.id}\nLien : {link}')
+            try:
+                await context.bot.send_message(chat.id, 'Garde la pêche 👋')
+                await context.bot.leave_chat(chat.id)
+            except TelegramError:
+                pass
+            return
+        async with SessionLocal() as s:
+            g = await s.get(Group, chat.id)
+            if not g:
+                g = Group(chat_id=chat.id, title=chat.title or str(chat.id), username=chat.username, source_token=token())
+                s.add(g)
+            g.last_seen_at = now(); await s.commit()
+        await notify_admins(context.bot, f'✅ <b>Nouveau groupe détecté</b>\n\n{chat.title}\nPromouvez le bot administrateur puis choisissez son rôle.', pending_group(chat.id, new == ChatMember.ADMINISTRATOR))
+    elif new in (ChatMember.LEFT, ChatMember.BANNED):
+        async with SessionLocal() as s:
+            g = await s.get(Group, chat.id)
+            if g:
+                g.last_health_ok = False; g.health_error = 'bot retiré ou banni'; await s.commit()
+        await notify_admins(context.bot, f'🚨 <b>Le bot a perdu la trace d’un groupe</b>\n\nGroupe : {chat.title}\nID : <code>{chat.id}</code>')
+
+
+async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cmu = update.chat_member
+    if not cmu or cmu.from_user.id == context.bot.id:
+        return
+    chat_id = cmu.chat.id
+    async with SessionLocal() as s:
+        group = await s.get(Group, chat_id)
+    if not group:
+        return
+    old, new = cmu.old_chat_member.status, cmu.new_chat_member.status
+    joined = old in (ChatMember.LEFT, ChatMember.BANNED) and new in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.RESTRICTED)
+    if not joined:
+        return
+    user = cmu.new_chat_member.user
+    if group.role == GroupRole.pub and cmu.invite_link:
+        async with SessionLocal() as s:
+            camp = await s.scalar(select(Campaign).where(Campaign.invite_link == cmu.invite_link.invite_link, Campaign.status == CampaignStatus.active))
+            if not camp or camp.user_id == user.id:
+                return
+            exists = await s.scalar(select(Invite).where(Invite.joined_user_id == user.id))
+            if exists:
+                camp.invalid_invites += 1
+                s.add(MetricEvent(event_type=EventType.invite_invalid, pub_group_id=group.chat_id, user_id=camp.user_id))
+                await s.commit(); return
+            bad = await forbidden_match(user)
+            if bad:
+                inviter = await s.get(User, camp.user_id)
+                inviter.forbidden_invites += 1
+                camp.invalid_invites += 1
+                s.add(Invite(campaign_id=camp.id, joined_user_id=user.id, joined_username=user.username, joined_name=user.full_name, status=InviteStatus.forbidden_profile, validate_after=now(), reason='profil non conforme'))
+                if inviter.forbidden_invites >= 3:
+                    inviter.banned = True; camp.status = CampaignStatus.banned
+                    try: await context.bot.send_message(camp.user_id, '⛔ Tu n’as pas invité des personnes FR valides. Tu es banni.')
+                    except TelegramError: pass
+                await s.commit(); return
+            s.add(Invite(campaign_id=camp.id, joined_user_id=user.id, joined_username=user.username, joined_name=user.full_name, validate_after=now() + timedelta(minutes=settings.validation_minutes)))
+            camp.pending_invites += 1
+            await s.commit()
+    elif group.role == GroupRole.vip:
+        async with SessionLocal() as s:
+            session = await s.scalar(select(VipSession).where(VipSession.user_id == user.id, VipSession.vip_group_id == group.chat_id, VipSession.status == VipSessionStatus.link_created).order_by(VipSession.id.desc()))
+            if not session:
+                try:
+                    await context.bot.ban_chat_member(group.chat_id, user.id)
+                    await context.bot.unban_chat_member(group.chat_id, user.id, only_if_banned=True)
+                except TelegramError as exc:
+                    await notify_admins(context.bot, f'🚨 Entrée VIP non autorisée impossible à expulser : {user.id}\n{exc}')
+                return
+            camp = await s.get(Campaign, session.campaign_id)
+            minutes = max(0, camp.minutes_earned - camp.minutes_consumed)
+            if minutes < settings.minimum_minutes:
+                return
+            session.status = VipSessionStatus.active; session.started_at = now(); session.expires_at = now() + timedelta(minutes=minutes); session.allocated_minutes = minutes
+            camp.minutes_consumed += minutes
+            s.add(MetricEvent(event_type=EventType.vip_join, pub_group_id=camp.pub_group_id, user_id=user.id))
+            await s.commit()
+        try:
+            await context.bot.send_message(user.id, f'✅ Bienvenue dans le VIP !\n\nTemps crédité : {minutes} minutes.\nChaque nouvelle invitation validée prolongera ton accès.')
+        except TelegramError: pass
+
+
+async def validate_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with SessionLocal() as s:
+        invites = list((await s.scalars(select(Invite).where(Invite.status == InviteStatus.pending, Invite.validate_after <= now()).limit(200))).all())
+        for inv in invites:
+            camp = await s.get(Campaign, inv.campaign_id)
+            try:
+                member = await context.bot.get_chat_member(camp.pub_group_id, inv.joined_user_id)
+                valid = member.status not in (ChatMember.LEFT, ChatMember.BANNED)
+            except TelegramError:
+                valid = False
+            camp.pending_invites = max(0, camp.pending_invites - 1)
+            inv.validated_at = now()
+            if valid:
+                inv.status = InviteStatus.valid; camp.valid_invites += 1; camp.minutes_earned += 1
+                s.add(MetricEvent(event_type=EventType.invite_valid, pub_group_id=camp.pub_group_id, user_id=camp.user_id))
+                active = await s.scalar(select(VipSession).where(VipSession.campaign_id == camp.id, VipSession.status == VipSessionStatus.active))
+                if active and active.expires_at:
+                    active.expires_at += timedelta(minutes=1)
+                    try: await context.bot.send_message(camp.user_id, f'🎉 Nouvelle invitation validée !\n+1 minute ajoutée. Nouvelle fin prévue : {active.expires_at:%H:%M}.')
+                    except TelegramError: pass
+            else:
+                inv.status = InviteStatus.invalid; camp.invalid_invites += 1; inv.reason = 'départ avant validation'
+                s.add(MetricEvent(event_type=EventType.invite_invalid, pub_group_id=camp.pub_group_id, user_id=camp.user_id))
+        await s.commit()
+
+
+async def expire_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with SessionLocal() as s:
+        sessions = list((await s.scalars(select(VipSession).where(VipSession.status.in_([VipSessionStatus.active, VipSessionStatus.kick_pending]), VipSession.expires_at <= now()).limit(100))).all())
+        for session in sessions:
+            session.status = VipSessionStatus.kick_pending; session.kick_attempts += 1
+            try:
+                await context.bot.ban_chat_member(session.vip_group_id, session.user_id)
+                await context.bot.unban_chat_member(session.vip_group_id, session.user_id, only_if_banned=True)
+                member = await context.bot.get_chat_member(session.vip_group_id, session.user_id)
+                if member.status in (ChatMember.LEFT, ChatMember.BANNED):
+                    session.status = VipSessionStatus.kicked; session.last_kick_error = None
+                    camp = await s.get(Campaign, session.campaign_id)
+                    s.add(MetricEvent(event_type=EventType.vip_kick, pub_group_id=camp.pub_group_id, user_id=session.user_id))
+                    try: await context.bot.send_message(session.user_id, f'⌛ Ton temps VIP est terminé.\n\nContinue à inviter pour gagner de nouvelles minutes. Il faut au moins {settings.minimum_minutes} minutes pour revenir.')
+                    except TelegramError: pass
+            except TelegramError as exc:
+                session.last_kick_error = str(exc)
+                await notify_admins(context.bot, f'❌ <b>Expulsion VIP impossible</b>\nUtilisateur : <code>{session.user_id}</code>\nErreur : {exc}')
+        await s.commit()
+
+
+async def send_health(message, context) -> None:
+    lines = ['🩺 <b>SANTÉ DU SYSTÈME</b>', '']
+    try:
+        me = await context.bot.get_me(); lines.append(f'🟢 Telegram : @{me.username}')
+    except TelegramError as exc:
+        lines.append(f'🔴 Telegram : {exc}')
+    try:
+        async with engine.connect() as conn: await conn.execute(select(1))
+        lines.append('🟢 PostgreSQL : connectée')
+    except Exception as exc:
+        lines.append(f'🔴 PostgreSQL : {exc}')
+    async with SessionLocal() as s:
+        pubs = list((await s.scalars(select(Group).where(Group.role == GroupRole.pub, Group.authorized.is_(True)))).all())
+        vips = list((await s.scalars(select(Group).where(Group.role == GroupRole.vip, Group.authorized.is_(True)))).all())
+    lines.append(f'{"🟢" if pubs else "🔴"} Groupes PUB : {len(pubs)}')
+    lines.append(f'{"🟢" if vips else "🔴"} Groupes VIP : {len(vips)}')
+    for g in vips + pubs:
+        ok, reason = await bot_rights(context.bot, g.chat_id)
+        lines.append(f'{"🟢" if ok else "🔴"} {g.title} — {reason}')
+    await message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
+
+
+async def health_watch(context: ContextTypes.DEFAULT_TYPE) -> None:
+    async with SessionLocal() as s:
+        groups = list((await s.scalars(select(Group).where(Group.authorized.is_(True), Group.role.in_([GroupRole.pub, GroupRole.vip])))).all())
+        for g in groups:
+            ok, reason = await bot_rights(context.bot, g.chat_id)
+            changed_to_error = g.last_health_ok and not ok
+            changed_to_ok = not g.last_health_ok and ok
+            g.last_health_ok = ok; g.health_error = None if ok else reason; g.last_seen_at = now() if ok else g.last_seen_at
+            if changed_to_error:
+                s.add(MetricEvent(event_type=EventType.health_error, pub_group_id=g.chat_id if g.role == GroupRole.pub else None, metadata_json=reason))
+                await notify_admins(context.bot, f'🚨 <b>Perte de connexion à un groupe</b>\n\n{g.title}\nID : <code>{g.chat_id}</code>\nErreur : {reason}')
+            elif changed_to_ok:
+                await notify_admins(context.bot, f'✅ Connexion rétablie : <b>{g.title}</b>')
+        await s.commit()
+
+
+async def send_group_stats(message, gid: int) -> None:
+    end = now(); start = end - timedelta(days=7); prev = start - timedelta(days=7)
+    async with SessionLocal() as s:
+        g = await s.get(Group, gid)
+        async def count(event, a, b):
+            return int(await s.scalar(select(func.count(MetricEvent.id)).where(MetricEvent.pub_group_id == gid, MetricEvent.event_type == event, MetricEvent.created_at >= a, MetricEvent.created_at < b)) or 0)
+        clicks = await count(EventType.ad_click, start, end); old_clicks = await count(EventType.ad_click, prev, start)
+        campaigns = await count(EventType.campaign_started, start, end); invites = await count(EventType.invite_valid, start, end); vip = await count(EventType.vip_join, start, end)
+    change = 0 if old_clicks == 0 else ((clicks - old_clicks) / old_clicks * 100)
+    trend = '🟢 hausse' if change > 10 else '🔴 perte d’intérêt' if change <= -settings.trend_drop_percent else '🟠 stable'
+    await message.reply_text(
+        f'📢 <b>{g.title}</b> — 7 jours\n\n👆 Clics : {clicks}\n🚀 Campagnes : {campaigns}\n✅ Invitations : {invites}\n🔐 Entrées VIP : {vip}\n\nÉvolution des clics : {change:+.1f}%\nDiagnostic : {trend}', parse_mode=ParseMode.HTML)
+
+
+async def send_global_stats(message) -> None:
+    since = now() - timedelta(days=7)
+    async with SessionLocal() as s:
+        campaigns = int(await s.scalar(select(func.count(Campaign.id)).where(Campaign.created_at >= since)) or 0)
+        valid = int(await s.scalar(select(func.count(Invite.id)).where(Invite.status == InviteStatus.valid, Invite.validated_at >= since)) or 0)
+        sessions = int(await s.scalar(select(func.count(VipSession.id)).where(VipSession.started_at >= since)) or 0)
+        kicked = int(await s.scalar(select(func.count(VipSession.id)).where(VipSession.status == VipSessionStatus.kicked, VipSession.updated_at >= since)) or 0)
+        errors = int(await s.scalar(select(func.count(VipSession.id)).where(VipSession.status == VipSessionStatus.kick_pending)) or 0)
+    await message.reply_text(f'📊 <b>STATISTIQUES — 7 JOURS</b>\n\nCampagnes : {campaigns}\nInvitations validées : {valid}\nSessions VIP : {sessions}\nExpulsions réussies : {kicked}\nExpulsions en attente/erreur : {errors}', parse_mode=ParseMode.HTML)
+
+
+async def post_init(app: Application) -> None:
+    settings.validate(); await init_db()
+    async with SessionLocal() as s:
+        for uid in settings.owner_ids:
+            if not await s.get(Admin, uid): s.add(Admin(telegram_id=uid, source='owner'))
+        await s.commit()
+    app.job_queue.run_repeating(validate_invites, interval=30, first=10, name='validate_invites')
+    app.job_queue.run_repeating(expire_sessions, interval=20, first=15, name='expire_sessions')
+    app.job_queue.run_repeating(health_watch, interval=settings.health_interval_minutes * 60, first=30, name='health_watch')
+
+
+def build() -> Application:
+    app = Application.builder().token(settings.bot_token).post_init(post_init).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CallbackQueryHandler(callback))
+    app.add_handler(ChatMemberHandler(my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(member_update, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler((filters.TEXT | filters.PHOTO) & filters.ChatType.PRIVATE, admin_input))
+    return app
+
+
+if __name__ == '__main__':
+    build().run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
