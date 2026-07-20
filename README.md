@@ -1,64 +1,67 @@
-# Bot Telegram VIP à la minute — Railway/PostgreSQL
+# Bot Telegram VIP à la minute — Railway + PostgreSQL
 
-## Principe
+## Parcours utilisateur
 
-- Chaque groupe PUB possède son texte et son image.
-- Le bouton public est toujours `🎁 VIP GRATUIT`.
-- Le clic mémorise le groupe d'origine.
-- Une seule campagne active par utilisateur.
-- 1 invitation validée = 1 minute.
-- Au moins 10 minutes sont nécessaires pour générer un lien VIP.
-- Le temps démarre à l'entrée réelle dans le VIP.
-- Les invitations reçues pendant la session prolongent l'expiration.
-- À zéro, le bot expulse puis vérifie la sortie.
+1. Une publicité est publiée dans un groupe PUB avec son image, son texte et le bouton unique **🎁 VIP GRATUIT**.
+2. Le bouton ouvre le bot en privé et mémorise définitivement le premier groupe PUB utilisé.
+3. Le bot crée immédiatement un lien personnel vers le VIP, sans afficher les conditions.
+4. Le délai découverte commence uniquement lorsque Telegram confirme l'entrée réelle dans le VIP.
+5. Après `TRIAL_MINUTES` (2 minutes par défaut), le bot retire l'utilisateur, vérifie l'expulsion puis lui envoie les conditions et son lien de parrainage.
+6. Une invitation validée rapporte une minute. Il faut au moins 10 minutes disponibles pour démarrer une nouvelle session VIP.
+7. Les invitations validées pendant une session payée prolongent la session d'une minute.
 
-## Installation Railway
+L'essai découverte ne peut être utilisé qu'une fois. Un lien découverte expiré avant utilisation peut être recréé.
 
-1. Créer un bot avec BotFather et désactiver le mode confidentialité si les événements de membres ne remontent pas.
-2. Créer un dépôt GitHub avec ce dossier.
-3. Dans Railway, créer un projet, ajouter PostgreSQL puis le service GitHub.
-4. Ajouter les variables de `.env.example`. `DATABASE_URL` peut référencer `${{Postgres.DATABASE_URL}}`.
-5. Déployer.
+## Notifications d'entrée et de sortie
 
-## Droits Telegram obligatoires
+Dans les groupes configurés en VIP, le bot supprime automatiquement les messages de service Telegram du type « X a rejoint le groupe » et « X a quitté le groupe ».
 
-Dans chaque groupe PUB et VIP, le bot doit être administrateur avec :
+Le bot doit être administrateur du VIP avec les droits :
 
-- Inviter des utilisateurs / gérer les liens d'invitation.
-- Bannir ou restreindre des membres.
+- inviter des utilisateurs ;
+- bannir/restreindre des membres ;
+- supprimer les messages.
 
-Le bot doit recevoir les mises à jour `chat_member`. Telegram exige que le bot soit administrateur pour recevoir ces informations de façon fiable.
+## Contrôle des expulsions
 
-## Premier branchement
+- tentative d'expulsion toutes les `KICK_RETRY_SECONDS` secondes ;
+- bannissement puis débannissement afin de permettre une future réentrée ;
+- vérification immédiate du statut Telegram après l'opération ;
+- conservation du statut `kick_pending` tant que Telegram ne confirme pas la sortie ;
+- alerte administrateur à la première erreur puis toutes les trois tentatives ;
+- audit récapitulatif toutes les cinq minutes ;
+- compteur des expulsions en attente dans **🩺 SANTÉ**.
 
-`OWNER_IDS` constitue la racine de confiance. Lorsque l'un de ces comptes ajoute le bot :
+## Bouton Santé
 
-1. Le groupe apparaît dans `👥 GROUPES`.
-2. Promouvoir le bot administrateur.
-3. Appuyer sur `🔄 VÉRIFIER`.
-4. Choisir `📢 GROUPE PUB` ou `🔐 GROUPE VIP`.
-5. Pour un PUB : configurer texte, image et VIP associé, prévisualiser, puis publier.
+Le bouton **🩺 SANTÉ** contrôle :
 
-Toute tentative d'ajout par un compte non autorisé provoque : récupération d'un lien quand possible, alerte aux administrateurs, message `Garde la pêche 👋`, puis départ du bot.
+- Telegram ;
+- PostgreSQL ;
+- présence d'au moins un groupe PUB ;
+- présence d'au moins un VIP ;
+- droits du bot dans chaque groupe ;
+- droit de suppression des messages dans le VIP ;
+- association de chaque PUB à un VIP ;
+- essais et sessions restant à expulser.
 
-## Statistiques
+Une surveillance automatique avertit les administrateurs lorsqu'un groupe devient inaccessible, lorsque le bot perd ses droits ou lorsqu'une association PUB/VIP manque.
 
-Le bot enregistre par groupe et par version publicitaire :
+## Raccordement non autorisé
 
-- publications ;
-- clics ;
-- campagnes ;
-- invitations validées/refusées ;
-- entrées VIP ;
-- expulsions ;
-- évolution des clics sur 7 jours par rapport aux 7 jours précédents.
+Si un non-administrateur autorisé ajoute le bot dans un groupe, le bot tente de récupérer un lien du groupe, transmet le groupe, l'auteur et le lien aux administrateurs, écrit **Garde la pêche 👋**, puis quitte le groupe.
 
-## Filtrage interne
+## Déploiement Railway
 
-Le menu `🚫 MOTS INTERDITS` ajoute des mots isolés insensibles à la casse. Ainsi `CP` correspond à `cp`, mais pas à `cpourtoi`. Après trois profils non conformes invités, le parrain est banni. Cette règle interne ne doit pas être présentée comme une vérification fiable de nationalité : Telegram ne fournit pas la nationalité des comptes.
+1. Créer un projet Railway.
+2. Ajouter PostgreSQL.
+3. Déployer ce dépôt ou cette archive.
+4. Ajouter les variables de `.env.example` dans Railway.
+5. Mettre votre identifiant Telegram dans `OWNER_IDS`.
+6. Ajouter le bot dans les groupes, le promouvoir administrateur, puis utiliser `/start` en privé.
+7. Classer les groupes avec le panneau : PUB ou VIP.
+8. Pour chaque PUB, configurer le texte, l'image et le VIP associé, puis publier.
 
-## Limites Telegram importantes
+## Base existante
 
-- Un bot ne peut attribuer une arrivée à un parrain que si la personne utilise un lien d'invitation créé par le bot et que l'événement contient ce lien.
-- Le bot ne peut pas connaître le nombre réel de vues d'une publicité ; les statistiques commencent au clic sur le bouton.
-- Pour expulser sans bannissement permanent, le bot bannit puis débannit immédiatement l'utilisateur.
+Cette version ajoute la table `trial_accesses` et de nouvelles valeurs d'événements. Sur une installation de test, le plus simple est d'utiliser une nouvelle base PostgreSQL. Pour une base contenant déjà des données importantes, effectuer une migration SQL contrôlée avant le redéploiement.
