@@ -16,6 +16,8 @@ class Settings:
     validation_minutes: int = int(os.environ.get('JOIN_VALIDATION_MINUTES', '5'))
     minimum_minutes: int = int(os.environ.get('MINIMUM_VIP_MINUTES', '10'))
     vip_link_ttl_minutes: int = int(os.environ.get('VIP_LINK_TTL_MINUTES', '15'))
+    trial_minutes: int = int(os.environ.get('TRIAL_MINUTES', '2'))
+    kick_retry_seconds: int = int(os.environ.get('KICK_RETRY_SECONDS', '20'))
     health_interval_minutes: int = int(os.environ.get('HEALTH_INTERVAL_MINUTES', '5'))
     trend_drop_percent: float = float(os.environ.get('TREND_DROP_PERCENT', '20'))
     timezone: str = os.environ.get('TIMEZONE', 'Europe/Paris')

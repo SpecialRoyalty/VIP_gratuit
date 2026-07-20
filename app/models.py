@@ -35,6 +35,14 @@ class InviteStatus(str, enum.Enum):
     duplicate = 'duplicate'
 
 
+class TrialStatus(str, enum.Enum):
+    link_created = 'link_created'
+    active = 'active'
+    kick_pending = 'kick_pending'
+    kicked = 'kicked'
+    cancelled = 'cancelled'
+
+
 class VipSessionStatus(str, enum.Enum):
     link_created = 'link_created'
     active = 'active'
@@ -54,6 +62,10 @@ class EventType(str, enum.Enum):
     vip_join = 'vip_join'
     vip_kick = 'vip_kick'
     health_error = 'health_error'
+    trial_link = 'trial_link'
+    trial_join = 'trial_join'
+    trial_kick = 'trial_kick'
+    unauthorized_join = 'unauthorized_join'
 
 
 class User(Base):
@@ -141,6 +153,24 @@ class VipSession(Base):
     allocated_minutes: Mapped[int] = mapped_column(Integer, default=0)
     kick_attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_kick_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class TrialAccess(Base):
+    __tablename__ = 'trial_accesses'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, ForeignKey('campaigns.id'), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    vip_group_id: Mapped[int] = mapped_column(BigInteger)
+    invite_link: Mapped[str | None] = mapped_column(Text, unique=True)
+    invite_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[TrialStatus] = mapped_column(Enum(TrialStatus), default=TrialStatus.link_created)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    kick_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_kick_error: Mapped[str | None] = mapped_column(Text)
+    kick_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

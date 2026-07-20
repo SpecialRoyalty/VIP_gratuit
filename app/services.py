@@ -56,7 +56,7 @@ async def record(event: EventType, pub_group_id: int | None = None, user_id: int
         await s.commit()
 
 
-async def bot_rights(bot, chat_id: int) -> tuple[bool, str]:
+async def bot_rights(bot, chat_id: int, require_delete: bool = False) -> tuple[bool, str]:
     try:
         m = await bot.get_chat_member(chat_id, bot.id)
     except TelegramError as exc:
@@ -69,6 +69,8 @@ async def bot_rights(bot, chat_id: int) -> tuple[bool, str]:
         return False, 'droit « inviter des utilisateurs » manquant'
     if not getattr(m, 'can_restrict_members', False):
         return False, 'droit « bannir/restreindre » manquant'
+    if require_delete and not getattr(m, 'can_delete_messages', False):
+        return False, 'droit « supprimer les messages » manquant'
     return True, 'OK'
 
 
