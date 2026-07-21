@@ -30,89 +30,198 @@ async def notify_admins(bot, text: str, markup=None) -> None:
             pass
 
 
+async def _send_trial_link(message, bot, camp: Campaign, user_id: int) -> bool:
+    """Crée ou renvoie l'accès découverte. Retourne True si un lien a été envoyé."""
+    async with SessionLocal() as sdb:
+        latest = await sdb.scalar(
+            select(TrialAccess)
+            .where(TrialAccess.user_id == user_id)
+            .order_by(TrialAccess.id.desc())
+        )
+        if latest and latest.status == TrialStatus.link_created:
+            if latest.invite_expires_at and latest.invite_expires_at <= now():
+                latest.status = TrialStatus.cancelled
+                await sdb.commit()
+                latest = None
+            elif latest.invite_link:
+                await message.reply_text(
+                    '🎁 <b>Ton accès est prêt.</b>\n\nProfite du VIP 👇',
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=latest.invite_link)]]
+                    ),
+                )
+                return True
+
+        # Un essai déjà commencé/terminé n'est jamais recréé.
+        if latest and latest.status in (
+            TrialStatus.active,
+            TrialStatus.kick_pending,
+            TrialStatus.kicked,
+        ):
+            return False
+
+    ok, reason = await bot_rights(bot, camp.vip_group_id, require_delete=True)
+    if not ok:
+        await message.reply_text('Le VIP est temporairement indisponible.')
+        await notify_admins(bot, f'🚨 <b>VIP indisponible</b>\n{reason}')
+        return True
+
+    expiry = now() + timedelta(minutes=settings.vip_link_ttl_minutes)
+    try:
+        link = await bot.create_chat_invite_link(
+            camp.vip_group_id,
+            name=f'essai-{user_id}'[:32],
+            expire_date=expiry,
+            member_limit=1,
+        )
+    except TelegramError as exc:
+        await message.reply_text('Impossible de préparer ton accès pour le moment.')
+        await notify_admins(bot, f'🚨 Création du lien découverte impossible : {exc}')
+        return True
+
+    async with SessionLocal() as sdb:
+        sdb.add(
+            TrialAccess(
+                campaign_id=camp.id,
+                user_id=user_id,
+                vip_group_id=camp.vip_group_id,
+                invite_link=link.invite_link,
+                invite_expires_at=expiry,
+            )
+        )
+        sdb.add(
+            MetricEvent(
+                event_type=EventType.trial_link,
+                pub_group_id=camp.pub_group_id,
+                user_id=user_id,
+            )
+        )
+        await sdb.commit()
+
+    await message.reply_text(
+        '🎁 <b>Ton accès est prêt.</b>\n\nProfite du VIP 👇',
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=link.invite_link)]]
+        ),
+    )
+    return True
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or update.effective_chat.type != ChatType.PRIVATE:
         return
+
     user = await ensure_user(update.effective_user)
     if await is_admin(user.telegram_id) and not context.args:
-        await update.message.reply_text('🛠 <b>Panneau administrateur</b>', parse_mode=ParseMode.HTML, reply_markup=admin_menu())
+        await update.message.reply_text(
+            '🛠 <b>Panneau administrateur</b>',
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
         return
+
     if user.banned:
         await update.message.reply_text('⛔ Tu n’as pas invité des personnes FR valides. Tu es banni.')
         return
+
+    camp = await active_campaign(user.telegram_id)
+
+    # Arrivée depuis le bouton « VIP GRATUIT » d'un groupe PUB.
     if context.args and context.args[0].startswith('pub_'):
         source = context.args[0][4:]
         async with SessionLocal() as sdb:
-            group = await sdb.scalar(select(Group).where(Group.source_token == source, Group.role == GroupRole.pub, Group.authorized.is_(True)))
+            group = await sdb.scalar(
+                select(Group).where(
+                    Group.source_token == source,
+                    Group.role == GroupRole.pub,
+                    Group.authorized.is_(True),
+                )
+            )
             if group:
-                sdb.add(MetricEvent(event_type=EventType.ad_click, pub_group_id=group.chat_id, ad_version=group.ad_version, user_id=user.telegram_id))
+                sdb.add(
+                    MetricEvent(
+                        event_type=EventType.ad_click,
+                        pub_group_id=group.chat_id,
+                        ad_version=group.ad_version,
+                        user_id=user.telegram_id,
+                    )
+                )
                 await sdb.commit()
+
         if not group or not group.vip_group_id:
             await update.message.reply_text('Cette publicité n’est pas correctement reliée au VIP.')
             return
 
-        camp = await active_campaign(user.telegram_id)
+        # La première origine reste immuable.
         if camp and camp.pub_group_id != group.chat_id:
+            if await _send_trial_link(update.effective_message, context.bot, camp, user.telegram_id):
+                return
             await show_counter(update.effective_message, user.telegram_id)
             return
+
         if not camp:
             ok, reason = await bot_rights(context.bot, group.chat_id)
             if not ok:
                 await update.message.reply_text('Ce groupe publicitaire est temporairement indisponible.')
-                await notify_admins(context.bot, f'🚨 <b>Groupe PUB indisponible</b>\n{group.title}\n{reason}')
+                await notify_admins(
+                    context.bot,
+                    f'🚨 <b>Groupe PUB indisponible</b>\n{group.title}\n{reason}',
+                )
                 return
             try:
-                ref = await context.bot.create_chat_invite_link(group.chat_id, name=f'parrain-{user.telegram_id}'[:32])
+                ref = await context.bot.create_chat_invite_link(
+                    group.chat_id,
+                    name=f'parrain-{user.telegram_id}'[:32],
+                )
             except TelegramError as exc:
                 await update.message.reply_text('Impossible de préparer ton accès pour le moment.')
-                await notify_admins(context.bot, f'🚨 Création du lien de parrainage impossible pour {group.title}: {exc}')
+                await notify_admins(
+                    context.bot,
+                    f'🚨 Création du lien de parrainage impossible pour {group.title}: {exc}',
+                )
                 return
+
             async with SessionLocal() as sdb:
-                camp = Campaign(user_id=user.telegram_id, pub_group_id=group.chat_id, vip_group_id=group.vip_group_id, invite_link=ref.invite_link)
+                camp = Campaign(
+                    user_id=user.telegram_id,
+                    pub_group_id=group.chat_id,
+                    vip_group_id=group.vip_group_id,
+                    invite_link=ref.invite_link,
+                )
                 sdb.add(camp)
-                sdb.add(MetricEvent(event_type=EventType.campaign_started, pub_group_id=group.chat_id, ad_version=group.ad_version, user_id=user.telegram_id))
+                await sdb.flush()
+                sdb.add(
+                    MetricEvent(
+                        event_type=EventType.campaign_started,
+                        pub_group_id=group.chat_id,
+                        ad_version=group.ad_version,
+                        user_id=user.telegram_id,
+                    )
+                )
                 await sdb.commit()
 
-        async with SessionLocal() as sdb:
-            prior_trial = await sdb.scalar(select(TrialAccess).where(TrialAccess.user_id == user.telegram_id).order_by(TrialAccess.id.desc()))
-            if prior_trial and prior_trial.status == TrialStatus.link_created and prior_trial.invite_expires_at and prior_trial.invite_expires_at <= now():
-                prior_trial.status = TrialStatus.cancelled
-                await sdb.commit()
-                prior_trial = None
-        if prior_trial and prior_trial.status == TrialStatus.link_created and prior_trial.invite_link:
-            await update.message.reply_text('🎁 <b>Ton accès est prêt.</b>\n\nProfite du VIP 👇', parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=prior_trial.invite_link)]]))
-            return
-        if prior_trial:
-            await show_counter(update.effective_message, user.telegram_id)
-            return
         if await active_session(user.telegram_id):
             await show_counter(update.effective_message, user.telegram_id)
             return
-
-        ok, reason = await bot_rights(context.bot, camp.vip_group_id, require_delete=True)
-        if not ok:
-            await update.message.reply_text('Le VIP est temporairement indisponible.')
-            await notify_admins(context.bot, f'🚨 <b>VIP indisponible</b>\n{reason}')
+        if await _send_trial_link(update.effective_message, context.bot, camp, user.telegram_id):
             return
-        expiry = now() + timedelta(minutes=settings.vip_link_ttl_minutes)
-        try:
-            link = await context.bot.create_chat_invite_link(camp.vip_group_id, name=f'essai-{user.telegram_id}'[:32], expire_date=expiry, member_limit=1)
-        except TelegramError as exc:
-            await update.message.reply_text('Impossible de préparer ton accès pour le moment.')
-            await notify_admins(context.bot, f'🚨 Création du lien découverte impossible : {exc}')
-            return
-        async with SessionLocal() as sdb:
-            sdb.add(TrialAccess(campaign_id=camp.id, user_id=user.telegram_id, vip_group_id=camp.vip_group_id, invite_link=link.invite_link, invite_expires_at=expiry))
-            sdb.add(MetricEvent(event_type=EventType.trial_link, pub_group_id=camp.pub_group_id, user_id=user.telegram_id))
-            await sdb.commit()
-        await update.message.reply_text('🎁 <b>Ton accès est prêt.</b>\n\nProfite du VIP 👇', parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=link.invite_link)]]))
+        await show_counter(update.effective_message, user.telegram_id)
         return
 
-    camp = await active_campaign(user.telegram_id)
+    # Correction V3 : une campagne ancienne, créée avant l'ajout de l'essai,
+    # reçoit aussi son accès découverte lors d'un simple /start.
     if camp:
+        if not await active_session(user.telegram_id):
+            if await _send_trial_link(update.effective_message, context.bot, camp, user.telegram_id):
+                return
         await show_counter(update.effective_message, user.telegram_id)
-    else:
-        await update.message.reply_text('Ouvre le bouton « 🎁 VIP GRATUIT » depuis un groupe publicitaire pour commencer.')
+        return
+
+    await update.message.reply_text(
+        'Ouvre le bouton « 🎁 VIP GRATUIT » depuis un groupe publicitaire pour commencer.'
+    )
 
 
 async def show_counter(message, user_id: int) -> None:
@@ -538,22 +647,70 @@ async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
             trial.status = TrialStatus.kick_pending
             trial.kick_attempts += 1
             ok, error = await _kick_and_verify(context.bot, trial.vip_group_id, trial.user_id)
+            camp = await sdb.get(Campaign, trial.campaign_id)
+            available = max(0, camp.minutes_earned - camp.minutes_consumed)
+
+            # Si l'utilisateur a atteint le seuil pendant son aperçu, son accès
+            # continue automatiquement sans expulsion. Tout son crédit disponible
+            # devient une session VIP normale à partir de maintenant.
+            if available >= settings.minimum_minutes:
+                trial.status = TrialStatus.cancelled
+                trial.last_kick_error = None
+                session = VipSession(
+                    campaign_id=camp.id,
+                    user_id=trial.user_id,
+                    vip_group_id=trial.vip_group_id,
+                    status=VipSessionStatus.active,
+                    started_at=now(),
+                    expires_at=now() + timedelta(minutes=available),
+                    allocated_minutes=available,
+                )
+                camp.minutes_consumed += available
+                sdb.add(session)
+                sdb.add(MetricEvent(event_type=EventType.vip_join, pub_group_id=camp.pub_group_id, user_id=trial.user_id))
+                try:
+                    await context.bot.send_message(
+                        trial.user_id,
+                        '🎉 <b>Félicitations !</b>\n\n'
+                        'Tu as déjà obtenu suffisamment d’invitations.\n'
+                        'Ton accès découverte continue automatiquement en accès VIP.\n\n'
+                        f'⏱ Temps ajouté : <b>{available} minute(s)</b>\n\n'
+                        'Continue à inviter : chaque nouvelle invitation validée prolongera ton accès d’une minute.',
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=user_menu(False, 0),
+                    )
+                except TelegramError:
+                    pass
+                continue
+
             if ok:
                 trial.status = TrialStatus.kicked
                 trial.kick_verified_at = now()
                 trial.last_kick_error = None
-                camp = await sdb.get(Campaign, trial.campaign_id)
                 sdb.add(MetricEvent(event_type=EventType.trial_kick, pub_group_id=camp.pub_group_id, user_id=trial.user_id))
+                missing = max(0, settings.minimum_minutes - available)
                 try:
                     await context.bot.send_message(
                         trial.user_id,
-                        '🎁 <b>Ton accès découverte est terminé.</b>\n\n'
-                        'Tu peux revenir gratuitement en invitant des personnes avec ton lien personnel.\n\n'
-                        '👤 <b>1 invitation validée = 1 minute dans le VIP</b>\n'
-                        f'🔐 Minimum requis pour entrer : <b>{settings.minimum_minutes} minutes</b>\n\n'
-                        f'🔗 <b>Ton lien personnel :</b>\n<code>{camp.invite_link}</code>',
+                        '⏳ <b>Ton accès découverte est terminé !</b>\n\n'
+                        'Tu as pu découvrir une partie du VIP. Il reste encore beaucoup de contenu à voir.\n\n'
+                        'La bonne nouvelle : tu peux revenir gratuitement autant de fois que tu le souhaites.\n\n'
+                        '🎁 <b>1 invitation validée = 1 minute de VIP</b>\n'
+                        f'🔐 Il faut au moins <b>{settings.minimum_minutes} invitations validées</b> pour revenir.\n\n'
+                        '━━━━━━━━━━━━━━\n'
+                        '📊 <b>Ton compteur</b>\n\n'
+                        f'✅ Invitations validées : <b>{camp.valid_invites}</b>\n'
+                        f'⏳ En vérification : <b>{camp.pending_invites}</b>\n'
+                        f'❌ Non validées : <b>{camp.invalid_invites}</b>\n\n'
+                        f'⏱ Crédit disponible : <b>{available} minute(s)</b>\n'
+                        f'🎯 Encore <b>{missing}</b> invitation(s) pour revenir dans le VIP.\n\n'
+                        '━━━━━━━━━━━━━━\n'
+                        '🔗 <b>Ton lien personnel</b>\n\n'
+                        f'<code>{camp.invite_link}</code>\n\n'
+                        'Partage-le où tu le souhaites. Chaque personne validée te rapporte une minute.',
                         parse_mode=ParseMode.HTML,
-                        reply_markup=user_menu(False, settings.minimum_minutes),
+                        reply_markup=user_menu(False, missing),
+                        disable_web_page_preview=True,
                     )
                 except TelegramError:
                     pass
@@ -601,7 +758,7 @@ async def audit_vip_members(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def send_health(message, context) -> None:
-    lines = ['🩺 <b>SANTÉ DU SYSTÈME</b>', '']
+    lines = ['🩺 <b>SANTÉ DU SYSTÈME</b>', '', f'🎁 Essai découverte : {settings.trial_minutes} minute(s)', f'🔁 Contrôle expulsions : toutes les {settings.kick_retry_seconds} seconde(s)', '']
     try:
         me = await context.bot.get_me(); lines.append(f'🟢 Telegram : @{me.username}')
     except TelegramError as exc:
