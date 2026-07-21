@@ -75,3 +75,23 @@ La V3 corrige le cas visible dans la capture où `/start` affichait directement 
 
 À la fin de l’essai, le bot affiche automatiquement le compteur réel et le lien personnel de l’utilisateur.
 Si le crédit disponible atteint déjà le seuil `MINIMUM_VIP_MINUTES`, l’utilisateur n’est pas expulsé : l’essai devient directement une session VIP normale.
+
+## Libération automatique après perte d'un groupe PUB
+
+Lorsqu'un groupe PUB est réellement inaccessible pendant le délai configuré, le bot clôture les campagnes actives liées à ce groupe, révoque les liens encore actifs, annule les invitations en attente et libère automatiquement les utilisateurs. Une réconciliation est lancée au démarrage pour corriger également les anciennes campagnes bloquées.
+
+Variable :
+
+```env
+GROUP_LOST_GRACE_MINUTES=10
+```
+
+Un simple VIP non associé est considéré comme une configuration incomplète et non comme une perte de connexion.
+
+## Broadcast privé
+
+Le bouton `📣 BROADCAST PRIVÉ` permet à un administrateur d'envoyer un texte ou une photo à tous les utilisateurs enregistrés. Le bot affiche un aperçu, demande confirmation, respecte un délai entre les messages et fournit un rapport final.
+
+```env
+BROADCAST_DELAY_SECONDS=0.05
+```

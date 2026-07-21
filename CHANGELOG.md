@@ -1,15 +1,27 @@
-# Changelog
+# Version 5.0.0
 
-## 4.0.0
+## Groupes PUB perdus
 
-- Nouveau message motivant envoyé après l’accès découverte de 2 minutes.
-- Le message affiche le compteur réel, le crédit disponible, le nombre manquant et le lien personnel.
-- Si l’utilisateur atteint le seuil minimum pendant l’essai, il n’est plus expulsé.
-- L’essai est alors transformé automatiquement en session VIP normale avec tout le crédit disponible.
-- Les vérifications automatiques d’expulsion, les nouvelles tentatives et les alertes administrateur restent actives.
+- Détection distincte entre un groupe réellement inaccessible et un simple VIP non associé.
+- Délai de confirmation configurable avec `GROUP_LOST_GRACE_MINUTES`.
+- Libération automatique des campagnes liées à un groupe PUB confirmé perdu.
+- Révocation des liens de parrainage et des liens VIP encore inutilisés.
+- Annulation des invitations encore en vérification.
+- Notification automatique des utilisateurs concernés, sans bouton supplémentaire.
+- Réconciliation rétroactive au démarrage pour corriger les campagnes déjà bloquées.
+- Opération idempotente : une campagne ne peut être libérée qu'une seule fois.
+- Un ancien groupe perdu peut être ajouté de nouveau et reconfiguré.
 
-## 3.0.0
+## Broadcast privé
 
-- Corrige le démarrage des essais pour les campagnes déjà existantes.
-- Un simple `/start` génère le lien découverte si l’utilisateur n’a jamais utilisé son essai.
-- `TRIAL_MINUTES` reste configurable et vaut 2 par défaut.
+- Nouveau bouton `📣 BROADCAST PRIVÉ` dans le panneau administrateur.
+- Envoi d'un texte ou d'une photo à tous les utilisateurs enregistrés.
+- Aperçu et confirmation avant l'envoi.
+- Envoi progressif avec gestion des limites Telegram.
+- Rapport final : envoyés, utilisateurs ayant bloqué le bot et erreurs.
+
+## Santé
+
+- Affichage du dernier bilan de réconciliation.
+- Les problèmes de configuration ne déclenchent plus une fausse perte de groupe.
+- Les expulsions et leurs nouvelles tentatives restent contrôlées automatiquement.
