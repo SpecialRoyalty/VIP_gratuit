@@ -19,6 +19,8 @@ class Settings:
     trial_minutes: int = int(os.environ.get('TRIAL_MINUTES', '2'))
     kick_retry_seconds: int = int(os.environ.get('KICK_RETRY_SECONDS', '20'))
     health_interval_minutes: int = int(os.environ.get('HEALTH_INTERVAL_MINUTES', '5'))
+    group_lost_grace_minutes: int = int(os.environ.get('GROUP_LOST_GRACE_MINUTES', '10'))
+    broadcast_delay_seconds: float = float(os.environ.get('BROADCAST_DELAY_SECONDS', '0.05'))
     trend_drop_percent: float = float(os.environ.get('TREND_DROP_PERCENT', '20'))
     timezone: str = os.environ.get('TIMEZONE', 'Europe/Paris')
 

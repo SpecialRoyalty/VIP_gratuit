@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -7,12 +8,12 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType, ParseMode
-from telegram.error import TelegramError
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import settings
 from .db import SessionLocal, engine, init_db
-from .keyboards import admin_menu, choose_vip, group_list, manage_pub, pending_group, start_campaign, user_menu, vip_confirm
+from .keyboards import admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, pending_group, start_campaign, user_menu, vip_confirm
 from .models import Admin, Campaign, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
 from .services import active_campaign, active_session, bot_rights, ensure_user, forbidden_match, is_admin, now, public_group_link, record, remaining_minutes, token
 
@@ -28,6 +29,149 @@ async def notify_admins(bot, text: str, markup=None) -> None:
             await bot.send_message(uid, text, parse_mode=ParseMode.HTML, reply_markup=markup, disable_web_page_preview=True)
         except TelegramError:
             pass
+
+
+LOST_CAMPAIGN_MESSAGE = (
+    '⚠️ <b>Ta campagne actuelle n’est plus disponible.</b>\n\n'
+    'Le groupe associé a été fermé ou n’est plus accessible.\n\n'
+    'Tu peux maintenant démarrer une nouvelle campagne depuis un autre groupe partenaire.'
+)
+
+
+def _connection_loss_reason(reason: str) -> bool:
+    """Évite de confondre une mauvaise configuration avec un groupe réellement perdu."""
+    value = (reason or '').casefold()
+    permanent_markers = (
+        'chat not found', 'bot is not a member', 'not a member', 'forbidden',
+        'kicked', 'banned', 'bot retiré', 'le bot n’est pas administrateur',
+    )
+    return any(marker in value for marker in permanent_markers)
+
+
+async def _safe_revoke(bot, chat_id: int, invite_link: str | None) -> bool:
+    if not invite_link:
+        return False
+    try:
+        await bot.revoke_chat_invite_link(chat_id, invite_link)
+        return True
+    except TelegramError:
+        return False
+
+
+async def release_lost_pub_group(bot, group_id: int, reason: str) -> dict[str, int]:
+    """Clôture les campagnes mortes et libère leurs utilisateurs, une seule fois.
+
+    Cette opération est idempotente : seules les campagnes encore actives sont traitées.
+    Les sessions VIP déjà actives continuent jusqu’à leur expiration normale.
+    """
+    stats = {'campaigns': 0, 'links': 0, 'invites': 0, 'users': 0}
+    async with SessionLocal() as sdb:
+        group = await sdb.get(Group, group_id)
+        if not group or group.role != GroupRole.pub:
+            return stats
+        campaigns = list((await sdb.scalars(
+            select(Campaign).where(
+                Campaign.pub_group_id == group_id,
+                Campaign.status == CampaignStatus.active,
+            )
+        )).all())
+        if not campaigns:
+            group.authorized = False
+            group.role = GroupRole.blocked
+            group.last_health_ok = False
+            group.health_error = f'groupe perdu : {reason}'
+            await sdb.commit()
+            return stats
+
+        notifications: list[int] = []
+        revoke_campaign_links: list[str] = []
+        revoke_trial_links: list[tuple[int, str]] = []
+        revoke_vip_links: list[tuple[int, str]] = []
+
+        for camp in campaigns:
+            camp.status = CampaignStatus.closed
+            camp.pending_invites = 0
+            stats['campaigns'] += 1
+            notifications.append(camp.user_id)
+            revoke_campaign_links.append(camp.invite_link)
+
+            pending = list((await sdb.scalars(select(Invite).where(
+                Invite.campaign_id == camp.id, Invite.status == InviteStatus.pending
+            ))).all())
+            for invite in pending:
+                invite.status = InviteStatus.invalid
+                invite.validated_at = now()
+                invite.reason = 'groupe source perdu'
+                stats['invites'] += 1
+
+            trials = list((await sdb.scalars(select(TrialAccess).where(
+                TrialAccess.campaign_id == camp.id, TrialAccess.status == TrialStatus.link_created
+            ))).all())
+            for trial in trials:
+                trial.status = TrialStatus.cancelled
+                if trial.invite_link:
+                    revoke_trial_links.append((trial.vip_group_id, trial.invite_link))
+
+            sessions = list((await sdb.scalars(select(VipSession).where(
+                VipSession.campaign_id == camp.id, VipSession.status == VipSessionStatus.link_created
+            ))).all())
+            for session in sessions:
+                session.status = VipSessionStatus.cancelled
+                if session.invite_link:
+                    revoke_vip_links.append((session.vip_group_id, session.invite_link))
+
+        group.authorized = False
+        group.role = GroupRole.blocked
+        group.last_health_ok = False
+        group.health_error = f'groupe perdu : {reason}'
+        await sdb.commit()
+
+    for link in revoke_campaign_links:
+        stats['links'] += int(await _safe_revoke(bot, group_id, link))
+    for chat_id, link in revoke_trial_links + revoke_vip_links:
+        stats['links'] += int(await _safe_revoke(bot, chat_id, link))
+    for uid in set(notifications):
+        try:
+            await bot.send_message(uid, LOST_CAMPAIGN_MESSAGE, parse_mode=ParseMode.HTML)
+            stats['users'] += 1
+        except TelegramError:
+            pass
+    return stats
+
+
+async def reconcile_lost_groups(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Corrige le passé et applique la règle aux groupes désormais perdus."""
+    grace = timedelta(minutes=settings.group_lost_grace_minutes)
+    totals = {'groups': 0, 'campaigns': 0, 'links': 0, 'invites': 0, 'users': 0}
+    async with SessionLocal() as sdb:
+        pubs = list((await sdb.scalars(select(Group).where(
+            Group.role == GroupRole.pub, Group.authorized.is_(True)
+        ))).all())
+    for group in pubs:
+        ok, reason = await bot_rights(context.bot, group.chat_id)
+        if ok:
+            continue
+        # Un groupe explicitement retiré est confirmé immédiatement. Pour les autres
+        # erreurs, on attend le délai afin d’éviter de réagir à une panne passagère.
+        explicit = _connection_loss_reason(reason)
+        old_enough = group.last_seen_at is None or now() - group.last_seen_at >= grace
+        if explicit and old_enough:
+            result = await release_lost_pub_group(context.bot, group.chat_id, reason)
+            if result['campaigns'] or result['users'] or result['links']:
+                totals['groups'] += 1
+                for key in ('campaigns', 'links', 'invites', 'users'):
+                    totals[key] += result[key]
+    context.application.bot_data['last_lost_reconciliation'] = totals
+    if totals['groups']:
+        await notify_admins(
+            context.bot,
+            '🧹 <b>Réconciliation des groupes perdus</b>\n\n'
+            f'Groupes confirmés perdus : {totals["groups"]}\n'
+            f'Campagnes libérées : {totals["campaigns"]}\n'
+            f'Liens révoqués : {totals["links"]}\n'
+            f'Invitations annulées : {totals["invites"]}\n'
+            f'Utilisateurs notifiés : {totals["users"]}'
+        )
 
 
 async def _send_trial_link(message, bot, camp: Campaign, user_id: int) -> bool:
@@ -431,6 +575,31 @@ async def admin_callback(q, context, data: str) -> None:
         await send_global_stats(q.message); return
     if data == 'a:health':
         await send_health(q.message, context); return
+    if data == 'a:broadcast':
+        context.user_data['admin_input'] = ('broadcast', 0)
+        context.user_data.pop('broadcast_source', None)
+        await q.message.reply_text(
+            '📣 <b>Broadcast privé</b>\n\nEnvoie maintenant le texte ou la photo à transmettre à tous les utilisateurs du bot.',
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if data == 'a:broadcast:cancel':
+        context.user_data.pop('admin_input', None)
+        context.user_data.pop('broadcast_source', None)
+        await q.message.reply_text('❌ Broadcast annulé.', reply_markup=admin_menu())
+        return
+    if data == 'a:broadcast:send':
+        source = context.user_data.pop('broadcast_source', None)
+        context.user_data.pop('admin_input', None)
+        if not source:
+            await q.message.reply_text('Aucun message à envoyer.')
+            return
+        await q.message.reply_text('🚀 Broadcast lancé. Le résultat sera envoyé ici à la fin.')
+        context.application.create_task(
+            run_broadcast(context.bot, q.from_user.id, source[0], source[1]),
+            name=f'broadcast-{q.from_user.id}',
+        )
+        return
     if data == 'a:words':
         async with SessionLocal() as s:
             rows = list((await s.scalars(select(ForbiddenWord).where(ForbiddenWord.active.is_(True)))).all())
@@ -456,6 +625,21 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             g = await s.get(Group, gid); g.ad_photo_file_id = update.message.photo[-1].file_id; g.ad_version += 1; await s.commit()
         context.user_data.pop('admin_input', None)
         await update.message.reply_text('✅ Image enregistrée.', reply_markup=manage_pub(gid))
+    elif kind == 'broadcast' and (update.message.text or update.message.photo):
+        context.user_data['broadcast_source'] = (update.message.chat_id, update.message.message_id)
+        async with SessionLocal() as s:
+            recipients = int(await s.scalar(select(func.count(User.telegram_id))) or 0)
+        await update.message.reply_text('👁 <b>Aperçu du broadcast</b>', parse_mode=ParseMode.HTML)
+        await context.bot.copy_message(
+            chat_id=update.message.chat_id,
+            from_chat_id=update.message.chat_id,
+            message_id=update.message.message_id,
+        )
+        await update.message.reply_text(
+            f'Destinataires enregistrés : <b>{recipients}</b>\n\nConfirme l’envoi à tous les utilisateurs.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=broadcast_confirm(),
+        )
     elif kind == 'forbidden_word' and update.message.text:
         word = update.message.text.strip()
         async with SessionLocal() as s:
@@ -490,14 +674,36 @@ async def my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if not g:
                 g = Group(chat_id=chat.id, title=chat.title or str(chat.id), username=chat.username, source_token=token())
                 s.add(g)
-            g.last_seen_at = now(); await s.commit()
+            elif g.role == GroupRole.blocked:
+                # Un ancien groupe perdu peut être rebranché et reconfiguré proprement.
+                g.role = GroupRole.pending
+                g.authorized = False
+                g.health_error = None
+            g.title = chat.title or str(chat.id)
+            g.username = chat.username
+            g.last_health_ok = True
+            g.last_seen_at = now()
+            await s.commit()
         await notify_admins(context.bot, f'✅ <b>Nouveau groupe détecté</b>\n\n{chat.title}\nPromouvez le bot administrateur puis choisissez son rôle.', pending_group(chat.id, new == ChatMember.ADMINISTRATOR))
     elif new in (ChatMember.LEFT, ChatMember.BANNED):
         async with SessionLocal() as s:
             g = await s.get(Group, chat.id)
+            role = g.role if g else None
             if g:
-                g.last_health_ok = False; g.health_error = 'bot retiré ou banni'; await s.commit()
-        await notify_admins(context.bot, f'🚨 <b>Le bot a perdu la trace d’un groupe</b>\n\nGroupe : {chat.title}\nID : <code>{chat.id}</code>')
+                g.last_health_ok = False
+                g.health_error = 'bot retiré ou banni'
+                await s.commit()
+        release = {'campaigns': 0, 'links': 0, 'invites': 0, 'users': 0}
+        if role == GroupRole.pub:
+            release = await release_lost_pub_group(context.bot, chat.id, 'bot retiré ou banni')
+        await notify_admins(
+            context.bot,
+            f'🚨 <b>Le bot a perdu la trace d’un groupe</b>\n\n'
+            f'Groupe : {chat.title}\nID : <code>{chat.id}</code>\n'
+            f'Campagnes libérées : {release["campaigns"]}\n'
+            f'Liens révoqués : {release["links"]}\n'
+            f'Utilisateurs notifiés : {release["users"]}'
+        )
 
 
 async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -757,6 +963,39 @@ async def audit_vip_members(context: ContextTypes.DEFAULT_TYPE) -> None:
         await notify_admins(context.bot, f'⚠️ <b>Contrôle des expulsions</b>\nEssais en attente : {bad_trials}\nSessions en attente : {bad_sessions}\nLe bot continue les nouvelles tentatives automatiquement.')
 
 
+async def run_broadcast(bot, admin_id: int, source_chat_id: int, source_message_id: int) -> None:
+    async with SessionLocal() as sdb:
+        user_ids = list((await sdb.scalars(select(User.telegram_id).order_by(User.telegram_id))).all())
+    sent = blocked = errors = 0
+    for uid in user_ids:
+        while True:
+            try:
+                await bot.copy_message(uid, source_chat_id, source_message_id)
+                sent += 1
+                break
+            except RetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 0.5)
+            except Forbidden:
+                blocked += 1
+                break
+            except (BadRequest, TelegramError):
+                errors += 1
+                break
+        await asyncio.sleep(max(0.0, settings.broadcast_delay_seconds))
+    try:
+        await bot.send_message(
+            admin_id,
+            '✅ <b>Broadcast terminé</b>\n\n'
+            f'Envoyés : {sent}\n'
+            f'Utilisateurs ayant bloqué le bot : {blocked}\n'
+            f'Autres erreurs : {errors}',
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
+    except TelegramError:
+        pass
+
+
 async def send_health(message, context) -> None:
     lines = ['🩺 <b>SANTÉ DU SYSTÈME</b>', '', f'🎁 Essai découverte : {settings.trial_minutes} minute(s)', f'🔁 Contrôle expulsions : toutes les {settings.kick_retry_seconds} seconde(s)', '']
     try:
@@ -784,25 +1023,69 @@ async def send_health(message, context) -> None:
         pending_sessions = int(await sdb.scalar(select(func.count(VipSession.id)).where(VipSession.status == VipSessionStatus.kick_pending)) or 0)
     lines.append(f'{"🟢" if pending_trials == 0 else "🔴"} Essais à expulser : {pending_trials}')
     lines.append(f'{"🟢" if pending_sessions == 0 else "🔴"} Sessions à expulser : {pending_sessions}')
+    rec = context.application.bot_data.get('last_lost_reconciliation', {})
+    if rec:
+        lines.append('')
+        lines.append('🧹 Dernière réconciliation des groupes perdus')
+        lines.append(f'Campagnes libérées : {rec.get("campaigns", 0)}')
+        lines.append(f'Liens révoqués : {rec.get("links", 0)}')
+        lines.append(f'Utilisateurs notifiés : {rec.get("users", 0)}')
     await message.reply_text('\n'.join(lines), parse_mode=ParseMode.HTML)
 
 
 async def health_watch(context: ContextTypes.DEFAULT_TYPE) -> None:
+    grace = timedelta(minutes=settings.group_lost_grace_minutes)
     async with SessionLocal() as s:
-        groups = list((await s.scalars(select(Group).where(Group.authorized.is_(True), Group.role.in_([GroupRole.pub, GroupRole.vip])))).all())
-        for g in groups:
-            ok, reason = await bot_rights(context.bot, g.chat_id, require_delete=(g.role == GroupRole.vip))
-            if g.role == GroupRole.pub and not g.vip_group_id:
-                ok, reason = False, 'aucun VIP associé'
-            changed_to_error = g.last_health_ok and not ok
-            changed_to_ok = not g.last_health_ok and ok
-            g.last_health_ok = ok; g.health_error = None if ok else reason; g.last_seen_at = now() if ok else g.last_seen_at
-            if changed_to_error:
-                s.add(MetricEvent(event_type=EventType.health_error, pub_group_id=g.chat_id if g.role == GroupRole.pub else None, metadata_json=reason))
-                await notify_admins(context.bot, f'🚨 <b>Perte de connexion à un groupe</b>\n\n{g.title}\nID : <code>{g.chat_id}</code>\nErreur : {reason}')
-            elif changed_to_ok:
-                await notify_admins(context.bot, f'✅ Connexion rétablie : <b>{g.title}</b>')
-        await s.commit()
+        groups = list((await s.scalars(select(Group).where(
+            Group.authorized.is_(True), Group.role.in_([GroupRole.pub, GroupRole.vip])
+        ))).all())
+
+    for group in groups:
+        ok, reason = await bot_rights(
+            context.bot, group.chat_id, require_delete=(group.role == GroupRole.vip)
+        )
+        connection_ok = ok
+        configuration_error = group.role == GroupRole.pub and not group.vip_group_id
+
+        async with SessionLocal() as s:
+            g = await s.get(Group, group.chat_id)
+            if not g:
+                continue
+            changed_to_error = g.last_health_ok and not connection_ok
+            changed_to_ok = not g.last_health_ok and connection_ok
+            g.last_health_ok = connection_ok
+            g.health_error = None if connection_ok else reason
+            if connection_ok:
+                g.last_seen_at = now()
+            await s.commit()
+
+        if changed_to_error:
+            await notify_admins(
+                context.bot,
+                f'⚠️ <b>Connexion au groupe à vérifier</b>\n\n'
+                f'{group.title}\nID : <code>{group.chat_id}</code>\nErreur : {reason}\n\n'
+                f'La libération automatique aura lieu si la perte est toujours confirmée après '
+                f'{settings.group_lost_grace_minutes} minute(s).',
+            )
+        elif changed_to_ok:
+            await notify_admins(context.bot, f'✅ Connexion rétablie : <b>{group.title}</b>')
+
+        if (not connection_ok and group.role == GroupRole.pub and
+                _connection_loss_reason(reason) and
+                (group.last_seen_at is None or now() - group.last_seen_at >= grace)):
+            result = await release_lost_pub_group(context.bot, group.chat_id, reason)
+            if result['campaigns'] or result['users'] or result['links']:
+                await notify_admins(
+                    context.bot,
+                    f'🧹 <b>Groupe PUB confirmé perdu</b>\n\n'
+                    f'{group.title}\nID : <code>{group.chat_id}</code>\n'
+                    f'Campagnes libérées : {result["campaigns"]}\n'
+                    f'Liens révoqués : {result["links"]}\n'
+                    f'Invitations annulées : {result["invites"]}\n'
+                    f'Utilisateurs notifiés : {result["users"]}',
+                )
+
+    await reconcile_lost_groups(context)
 
 
 async def send_group_stats(message, gid: int) -> None:
@@ -841,6 +1124,7 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(expire_sessions, interval=settings.kick_retry_seconds, first=15, name='expire_sessions')
     app.job_queue.run_repeating(audit_vip_members, interval=300, first=120, name='audit_vip_members')
     app.job_queue.run_repeating(health_watch, interval=settings.health_interval_minutes * 60, first=30, name='health_watch')
+    app.job_queue.run_once(reconcile_lost_groups, when=8, name='reconcile_lost_groups_startup')
 
 
 def build() -> Application:

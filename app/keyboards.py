@@ -5,6 +5,7 @@ def admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton('🩺 SANTÉ', callback_data='a:health'), InlineKeyboardButton('📊 STATISTIQUES', callback_data='a:stats')],
         [InlineKeyboardButton('👥 GROUPES', callback_data='a:groups'), InlineKeyboardButton('🚫 MOTS INTERDITS', callback_data='a:words')],
+        [InlineKeyboardButton('📣 BROADCAST PRIVÉ', callback_data='a:broadcast')],
     ])
 
 
@@ -58,3 +59,10 @@ def start_campaign() -> InlineKeyboardMarkup:
 
 def vip_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton('✅ GÉNÉRER MON LIEN VIP', callback_data='u:confirmvip')], [InlineKeyboardButton('❌ ANNULER', callback_data='u:counter')]])
+
+
+def broadcast_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('✅ ENVOYER À TOUS', callback_data='a:broadcast:send')],
+        [InlineKeyboardButton('❌ ANNULER', callback_data='a:broadcast:cancel')],
+    ])
