@@ -25,3 +25,16 @@
 - Affichage du dernier bilan de réconciliation.
 - Les problèmes de configuration ne déclenchent plus une fausse perte de groupe.
 - Les expulsions et leurs nouvelles tentatives restent contrôlées automatiquement.
+
+# Version 5.1.0
+
+## Correction globale des sessions fantômes
+
+- Les liens VIP `link_created` expirés ne bloquent plus le bouton d'accès.
+- Nettoyage rétroactif de tous les anciens liens expirés au redémarrage.
+- Nettoyage automatique toutes les 30 secondes.
+- Révocation des liens expirés encore révocables.
+- Envoi automatique d'un panneau corrigé aux utilisateurs touchés : aucun nouveau `/start` requis.
+- Le bouton `ENCORE 0 INVITATIONS` n'est plus jamais affiché.
+- Le bouton Santé affiche le bilan du dernier nettoyage global.
+- Les minutes gagnées pendant une session active sont désormais consommées immédiatement lorsqu'elles prolongent cette session.

@@ -95,3 +95,9 @@ Le bouton `📣 BROADCAST PRIVÉ` permet à un administrateur d'envoyer un texte
 ```env
 BROADCAST_DELAY_SECONDS=0.05
 ```
+
+## Correctif 5.1 — liens VIP expirés
+
+Au démarrage, le bot recherche globalement les anciennes sessions `link_created` dont le lien est expiré. Elles sont marquées `expired`, les liens sont révoqués lorsque possible et les utilisateurs concernés reçoivent automatiquement un panneau actualisé. Ils n'ont pas besoin de refaire `/start`.
+
+Le même contrôle est relancé toutes les 30 secondes. Le bouton `🩺 SANTÉ` affiche le dernier bilan de cette correction.
