@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatType, ParseMode
@@ -376,9 +376,17 @@ async def show_counter(message, user_id: int) -> None:
     rem = await remaining_minutes(camp)
     session = await active_session(user_id)
     status = 'Aucun accès actif'
+    blocked_label = None
     if session and session.status == VipSessionStatus.active and session.expires_at:
         seconds = max(0, int((session.expires_at - now()).total_seconds()))
         status = f'VIP actif — environ {seconds // 60} min restantes'
+        blocked_label = '⏱ ACCÈS VIP EN COURS'
+    elif session and session.status == VipSessionStatus.link_created:
+        status = 'Lien VIP déjà généré'
+        blocked_label = '🔐 LIEN VIP DÉJÀ GÉNÉRÉ'
+    elif session and session.status == VipSessionStatus.kick_pending:
+        status = 'Sortie VIP en cours de vérification'
+        blocked_label = '⏳ VÉRIFICATION EN COURS'
     missing = max(0, settings.minimum_minutes - rem)
     text = (
         '📊 <b>Ton compteur</b>\n\n'
@@ -390,7 +398,15 @@ async def show_counter(message, user_id: int) -> None:
     )
     if rem < settings.minimum_minutes:
         text += f'\n\nIl te manque <b>{missing}</b> invitation(s) valide(s) pour générer un accès.'
-    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=user_menu(rem >= settings.minimum_minutes and not session, missing))
+    await message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=user_menu(
+            rem >= settings.minimum_minutes and not session,
+            missing,
+            blocked_label=blocked_label,
+        ),
+    )
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -827,7 +843,12 @@ async def validate_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
                 s.add(MetricEvent(event_type=EventType.invite_valid, pub_group_id=camp.pub_group_id, user_id=camp.user_id))
                 active = await s.scalar(select(VipSession).where(VipSession.campaign_id == camp.id, VipSession.status == VipSessionStatus.active))
                 if active and active.expires_at:
+                    # La minute est utilisée immédiatement puisqu'elle prolonge une
+                    # session déjà en cours. Elle ne doit pas rester une seconde fois
+                    # dans le crédit disponible après l'expulsion.
                     active.expires_at += timedelta(minutes=1)
+                    active.allocated_minutes += 1
+                    camp.minutes_consumed += 1
                     try: await context.bot.send_message(camp.user_id, f'🎉 Nouvelle invitation validée !\n+1 minute ajoutée. Nouvelle fin prévue : {active.expires_at:%H:%M}.')
                     except TelegramError: pass
             else:
@@ -927,6 +948,92 @@ async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
         await sdb.commit()
 
 
+async def cleanup_expired_vip_links(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Libère globalement les utilisateurs bloqués par d'anciens liens VIP.
+
+    La correction est exécutée au démarrage puis périodiquement. Elle est
+    rétroactive et idempotente : seules les sessions encore ``link_created`` et
+    réellement expirées sont modifiées.
+    """
+    current = now()
+    fallback_expiry = current - timedelta(minutes=settings.vip_link_ttl_minutes)
+    revoked = 0
+    affected_users: set[int] = set()
+
+    async with SessionLocal() as sdb:
+        stale = list((await sdb.scalars(
+            select(VipSession).where(
+                VipSession.status == VipSessionStatus.link_created,
+                or_(
+                    and_(
+                        VipSession.invite_expires_at.is_not(None),
+                        VipSession.invite_expires_at <= current,
+                    ),
+                    and_(
+                        VipSession.invite_expires_at.is_(None),
+                        VipSession.created_at <= fallback_expiry,
+                    ),
+                ),
+            ).limit(1000)
+        )).all())
+
+        for vip_session in stale:
+            if vip_session.invite_link:
+                revoked += int(await _safe_revoke(
+                    context.bot,
+                    vip_session.vip_group_id,
+                    vip_session.invite_link,
+                ))
+            vip_session.status = VipSessionStatus.expired
+            vip_session.last_kick_error = None
+            affected_users.add(vip_session.user_id)
+
+        await sdb.commit()
+
+    notified = 0
+    # Actualisation proactive : les personnes touchées n'ont pas besoin de refaire
+    # /start. Telegram ne permet pas de forcer la commande côté client, mais le bot
+    # peut leur renvoyer immédiatement un panneau corrigé.
+    for user_id in affected_users:
+        camp = await active_campaign(user_id)
+        if not camp:
+            continue
+        remaining = await remaining_minutes(camp)
+        missing = max(0, settings.minimum_minutes - remaining)
+        try:
+            await context.bot.send_message(
+                user_id,
+                '✅ <b>Ton accès a été actualisé.</b>\n\n'
+                'Un ancien lien VIP expiré a été nettoyé. '
+                'Tu peux maintenant utiliser normalement ton crédit disponible.\n\n'
+                f'⏱ Crédit disponible : <b>{remaining} minute(s)</b>',
+                parse_mode=ParseMode.HTML,
+                reply_markup=user_menu(
+                    remaining >= settings.minimum_minutes,
+                    missing,
+                ),
+            )
+            notified += 1
+        except TelegramError:
+            pass
+
+    result = {
+        'sessions_repaired': len(affected_users),
+        'links_revoked': revoked,
+        'users_notified': notified,
+    }
+    context.application.bot_data['last_vip_link_cleanup'] = result
+
+    if affected_users:
+        await notify_admins(
+            context.bot,
+            '🧹 <b>Correction globale des accès VIP</b>\n\n'
+            f'Utilisateurs libérés : {len(affected_users)}\n'
+            f'Liens expirés révoqués : {revoked}\n'
+            f'Panneaux actualisés : {notified}',
+        )
+
+
 async def expire_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     async with SessionLocal() as sdb:
         sessions = list((await sdb.scalars(select(VipSession).where(VipSession.status.in_([VipSessionStatus.active, VipSessionStatus.kick_pending]), VipSession.expires_at <= now()).limit(100))).all())
@@ -939,11 +1046,16 @@ async def expire_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
                 session.last_kick_error = None
                 camp = await sdb.get(Campaign, session.campaign_id)
                 sdb.add(MetricEvent(event_type=EventType.vip_kick, pub_group_id=camp.pub_group_id, user_id=session.user_id))
+                remaining = max(0, camp.minutes_earned - camp.minutes_consumed)
+                missing = max(0, settings.minimum_minutes - remaining)
                 try:
                     await context.bot.send_message(
                         session.user_id,
-                        f'⌛ Ton temps VIP est terminé.\n\nContinue à inviter pour gagner de nouvelles minutes. Il faut au moins {settings.minimum_minutes} minutes pour revenir.',
-                        reply_markup=user_menu(False, settings.minimum_minutes),
+                        f'⌛ Ton temps VIP est terminé.\n\n'
+                        f'Crédit disponible : {remaining} minute(s).\n'
+                        f'Continue à inviter pour gagner de nouvelles minutes. '
+                        f'Il faut au moins {settings.minimum_minutes} minutes pour revenir.',
+                        reply_markup=user_menu(remaining >= settings.minimum_minutes, missing),
                     )
                 except TelegramError:
                     pass
@@ -1023,6 +1135,13 @@ async def send_health(message, context) -> None:
         pending_sessions = int(await sdb.scalar(select(func.count(VipSession.id)).where(VipSession.status == VipSessionStatus.kick_pending)) or 0)
     lines.append(f'{"🟢" if pending_trials == 0 else "🔴"} Essais à expulser : {pending_trials}')
     lines.append(f'{"🟢" if pending_sessions == 0 else "🔴"} Sessions à expulser : {pending_sessions}')
+    cleanup = context.application.bot_data.get('last_vip_link_cleanup', {})
+    if cleanup:
+        lines.append('')
+        lines.append('🧹 Dernier nettoyage des liens VIP expirés')
+        lines.append(f'Utilisateurs libérés : {cleanup.get("sessions_repaired", 0)}')
+        lines.append(f'Liens révoqués : {cleanup.get("links_revoked", 0)}')
+        lines.append(f'Panneaux actualisés : {cleanup.get("users_notified", 0)}')
     rec = context.application.bot_data.get('last_lost_reconciliation', {})
     if rec:
         lines.append('')
@@ -1122,6 +1241,7 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(validate_invites, interval=30, first=10, name='validate_invites')
     app.job_queue.run_repeating(expire_trials, interval=settings.kick_retry_seconds, first=10, name='expire_trials')
     app.job_queue.run_repeating(expire_sessions, interval=settings.kick_retry_seconds, first=15, name='expire_sessions')
+    app.job_queue.run_repeating(cleanup_expired_vip_links, interval=30, first=3, name='cleanup_expired_vip_links')
     app.job_queue.run_repeating(audit_vip_members, interval=300, first=120, name='audit_vip_members')
     app.job_queue.run_repeating(health_watch, interval=settings.health_interval_minutes * 60, first=30, name='health_watch')
     app.job_queue.run_once(reconcile_lost_groups, when=8, name='reconcile_lost_groups_startup')

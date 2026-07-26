@@ -38,14 +38,19 @@ def choose_vip(pub_id: int, vips) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def user_menu(can_use: bool = False, missing: int = 0) -> InlineKeyboardMarkup:
+def user_menu(can_use: bool = False, missing: int = 0, blocked_label: str | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton('📊 MON COMPTEUR', callback_data='u:counter'), InlineKeyboardButton('🔗 MON LIEN', callback_data='u:link')],
     ]
     if can_use:
         rows.append([InlineKeyboardButton('🔐 UTILISER MES MINUTES', callback_data='u:use')])
+    elif blocked_label:
+        rows.append([InlineKeyboardButton(blocked_label, callback_data='u:counter')])
+    elif missing > 0:
+        rows.append([InlineKeyboardButton(f'🔒 ENCORE {missing} INVITATIONS', callback_data='u:counter')])
     else:
-        rows.append([InlineKeyboardButton(f'🔒 ENCORE {max(0, missing)} INVITATIONS', callback_data='u:counter')])
+        # Sécurité d'affichage : ne jamais montrer « ENCORE 0 INVITATIONS ».
+        rows.append([InlineKeyboardButton('🔄 ACTUALISER MON ACCÈS', callback_data='u:counter')])
     rows.append([InlineKeyboardButton('📖 RÈGLES', callback_data='u:rules')])
     return InlineKeyboardMarkup(rows)
 

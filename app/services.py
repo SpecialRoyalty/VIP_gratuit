@@ -5,7 +5,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from telegram import ChatMember
 from telegram.error import TelegramError
 
@@ -46,8 +46,30 @@ async def active_campaign(user_id: int) -> Campaign | None:
 
 
 async def active_session(user_id: int) -> VipSession | None:
+    """Retourne uniquement une session qui bloque réellement un nouvel accès.
+
+    Un ancien lien VIP non utilisé ne doit plus bloquer l'utilisateur après son
+    expiration. Le nettoyage périodique le marquera aussi comme ``expired``, mais
+    cette condition protège immédiatement l'interface entre deux passages du job.
+    """
+    current = now()
     async with SessionLocal() as s:
-        return await s.scalar(select(VipSession).where(VipSession.user_id == user_id, VipSession.status.in_([VipSessionStatus.link_created, VipSessionStatus.active, VipSessionStatus.kick_pending])).order_by(VipSession.id.desc()))
+        return await s.scalar(
+            select(VipSession)
+            .where(
+                VipSession.user_id == user_id,
+                or_(
+                    VipSession.status == VipSessionStatus.active,
+                    VipSession.status == VipSessionStatus.kick_pending,
+                    and_(
+                        VipSession.status == VipSessionStatus.link_created,
+                        VipSession.invite_expires_at.is_not(None),
+                        VipSession.invite_expires_at > current,
+                    ),
+                ),
+            )
+            .order_by(VipSession.id.desc())
+        )
 
 
 async def record(event: EventType, pub_group_id: int | None = None, user_id: int | None = None, ad_version: int | None = None, metadata: dict | None = None) -> None:
