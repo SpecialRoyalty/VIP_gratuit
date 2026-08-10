@@ -6,6 +6,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton('🩺 SANTÉ', callback_data='a:health'), InlineKeyboardButton('📊 STATISTIQUES', callback_data='a:stats')],
         [InlineKeyboardButton('👥 GROUPES', callback_data='a:groups'), InlineKeyboardButton('🚫 MOTS INTERDITS', callback_data='a:words')],
         [InlineKeyboardButton('📣 BROADCAST PRIVÉ', callback_data='a:broadcast')],
+        [InlineKeyboardButton('🛠 RÉPARER LES LIENS', callback_data='a:repairlinks')],
     ])
 
 

@@ -58,6 +58,205 @@ async def _safe_revoke(bot, chat_id: int, invite_link: str | None) -> bool:
         return False
 
 
+async def ensure_campaign_invite_link(bot, campaign: Campaign, *, notify_user: bool = False) -> tuple[str | None, bool, str]:
+    """Vérifie le lien de parrainage d'une campagne et le remplace s'il est mort.
+
+    Retourne ``(link, repaired, reason)``. La campagne, ses compteurs et ses minutes
+    sont toujours conservés. Un groupe PUB indisponible n'est jamais remplacé ici :
+    sa gestion reste celle de la réconciliation des groupes perdus.
+    """
+    async with SessionLocal() as sdb:
+        camp = await sdb.get(Campaign, campaign.id)
+        if not camp or camp.status != CampaignStatus.active:
+            return None, False, 'campagne inactive'
+        group = await sdb.get(Group, camp.pub_group_id)
+        if not group or group.role != GroupRole.pub or not group.authorized:
+            return None, False, 'groupe PUB indisponible'
+        old_link = camp.invite_link
+        user_id = camp.user_id
+        pub_group_id = camp.pub_group_id
+
+    ok, rights_reason = await bot_rights(bot, pub_group_id)
+    if not ok:
+        return None, False, rights_reason
+
+    # Telegram ne fournit pas de méthode « get invite link ». Éditer le lien
+    # supplémentaire créé par le bot sert ici de contrôle d'existence. Nous
+    # conservons les paramètres de nos liens de campagne (pas d'expiration,
+    # pas de limite de membres) et leur nom déterministe.
+    try:
+        checked = await bot.edit_chat_invite_link(
+            chat_id=pub_group_id,
+            invite_link=old_link,
+            name=f'parrain-{user_id}'[:32],
+            expire_date=None,
+            member_limit=None,
+            creates_join_request=False,
+        )
+        if not checked.is_revoked:
+            return checked.invite_link, False, 'OK'
+    except RetryAfter as exc:
+        await asyncio.sleep(float(exc.retry_after) + 0.5)
+        return None, False, 'limite Telegram, nouvel essai nécessaire'
+    except TelegramError:
+        # Le groupe et les droits ont déjà été vérifiés. Si Telegram refuse le
+        # lien stocké, on le considère comme inutilisable et on le remplace.
+        pass
+
+    try:
+        fresh = await bot.create_chat_invite_link(
+            chat_id=pub_group_id,
+            name=f'parrain-{user_id}'[:32],
+        )
+    except RetryAfter as exc:
+        await asyncio.sleep(float(exc.retry_after) + 0.5)
+        return None, False, 'limite Telegram pendant la recréation'
+    except TelegramError as exc:
+        return None, False, f'recréation impossible : {exc}'
+
+    async with SessionLocal() as sdb:
+        camp = await sdb.get(Campaign, campaign.id)
+        if not camp or camp.status != CampaignStatus.active:
+            try:
+                await bot.revoke_chat_invite_link(pub_group_id, fresh.invite_link)
+            except TelegramError:
+                pass
+            return None, False, 'campagne fermée pendant la réparation'
+        camp.invite_link = fresh.invite_link
+        camp.updated_at = now()
+        await sdb.commit()
+
+    if notify_user:
+        try:
+            await bot.send_message(
+                user_id,
+                '🔧 <b>Ton lien personnel a été réparé.</b>\n\n'
+                'Un ancien lien n’était plus utilisable. Ton compteur et tes minutes ont été conservés.\n\n'
+                f'🔗 <code>{fresh.invite_link}</code>',
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except TelegramError:
+            pass
+    return fresh.invite_link, True, 'lien recréé'
+
+
+async def repair_campaign_links(bot, *, notify_users: bool, limit: int | None = None, after_id: int = 0) -> dict[str, int]:
+    """Audit et réparation des liens de campagnes actives.
+
+    ``limit`` permet au contrôle automatique de travailler par petits lots. Le
+    bouton administrateur utilise ``None`` pour auditer toutes les campagnes.
+    """
+    stats = {
+        'scanned': 0, 'affected': 0, 'repaired': 0, 'notified': 0,
+        'healthy': 0, 'group_errors': 0, 'errors': 0, 'last_id': after_id,
+    }
+    async with SessionLocal() as sdb:
+        stmt = select(Campaign).where(
+            Campaign.status == CampaignStatus.active,
+            Campaign.id > after_id,
+        ).order_by(Campaign.id.asc())
+        if limit:
+            stmt = stmt.limit(limit)
+        campaigns = list((await sdb.scalars(stmt)).all())
+
+    for camp in campaigns:
+        stats['scanned'] += 1
+        stats['last_id'] = max(stats['last_id'], camp.id)
+        old_link = camp.invite_link
+        link, repaired, reason = await ensure_campaign_invite_link(bot, camp, notify_user=False)
+        if repaired:
+            stats['affected'] += 1
+            stats['repaired'] += 1
+            if notify_users and link:
+                try:
+                    await bot.send_message(
+                        camp.user_id,
+                        '🔧 <b>Ton lien personnel a été réparé.</b>\n\n'
+                        'Ton ancien lien n’était plus utilisable. Aucun compteur ni aucune minute n’a été perdu.\n\n'
+                        f'Voici ton nouveau lien :\n<code>{link}</code>',
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True,
+                    )
+                    stats['notified'] += 1
+                except TelegramError:
+                    pass
+        elif link:
+            stats['healthy'] += 1
+        elif 'groupe' in reason.casefold() or 'administrateur' in reason.casefold() or 'droit' in reason.casefold():
+            stats['group_errors'] += 1
+        else:
+            stats['errors'] += 1
+        # Petit délai pour éviter une rafale d'appels API lors d'une réparation globale.
+        await asyncio.sleep(0.03)
+    return stats
+
+
+async def run_manual_link_repair(bot, admin_id: int) -> None:
+    stats = await repair_campaign_links(bot, notify_users=True)
+    try:
+        await bot.send_message(
+            admin_id,
+            '🛠 <b>Réparation globale terminée</b>\n\n'
+            f'Campagnes contrôlées : <b>{stats["scanned"]}</b>\n'
+            f'Personnes concernées : <b>{stats["affected"]}</b>\n'
+            f'Liens réparés : <b>{stats["repaired"]}</b>\n'
+            f'Utilisateurs prévenus : <b>{stats["notified"]}</b>\n'
+            f'Liens déjà sains : <b>{stats["healthy"]}</b>\n'
+            f'Groupes à vérifier : <b>{stats["group_errors"]}</b>\n'
+            f'Autres erreurs : <b>{stats["errors"]}</b>',
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
+    except TelegramError:
+        pass
+
+
+async def campaign_link_watch(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Contrôle permanent par lots pour éviter de renvoyer des liens morts à l'avenir."""
+    cursor = int(context.application.bot_data.get('campaign_link_cursor', 0) or 0)
+    batch = max(1, settings.campaign_link_audit_batch)
+    stats = await repair_campaign_links(
+        context.bot,
+        notify_users=True,
+        limit=batch,
+        after_id=cursor,
+    )
+    # Fin de la liste : on repart du début au prochain passage.
+    if stats['scanned'] < batch:
+        context.application.bot_data['campaign_link_cursor'] = 0
+    else:
+        context.application.bot_data['campaign_link_cursor'] = stats['last_id']
+    context.application.bot_data['last_campaign_link_audit'] = stats
+    if stats['repaired'] or stats['group_errors'] or stats['errors']:
+        await notify_admins(
+            context.bot,
+            '🔗 <b>Contrôle automatique des liens</b>\n\n'
+            f'Contrôlés : {stats["scanned"]}\n'
+            f'Liens réparés : {stats["repaired"]}\n'
+            f'Utilisateurs prévenus : {stats["notified"]}\n'
+            f'Groupes à vérifier : {stats["group_errors"]}\n'
+            f'Erreurs : {stats["errors"]}',
+        )
+
+
+async def startup_campaign_link_repair(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Répare le passé à chaque déploiement, sans attendre un clic utilisateur."""
+    stats = await repair_campaign_links(context.bot, notify_users=True)
+    context.application.bot_data['last_campaign_link_audit'] = stats
+    if stats['affected'] or stats['group_errors'] or stats['errors']:
+        await notify_admins(
+            context.bot,
+            '🧰 <b>Réparation des liens au démarrage</b>\n\n'
+            f'Campagnes contrôlées : {stats["scanned"]}\n'
+            f'Personnes concernées : {stats["affected"]}\n'
+            f'Liens réparés : {stats["repaired"]}\n'
+            f'Utilisateurs prévenus : {stats["notified"]}\n'
+            f'Groupes à vérifier : {stats["group_errors"]}\n'
+            f'Erreurs : {stats["errors"]}',
+        )
+
+
 async def release_lost_pub_group(bot, group_id: int, reason: str) -> dict[str, int]:
     """Clôture les campagnes mortes et libère leurs utilisateurs, une seule fois.
 
@@ -465,7 +664,12 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data == 'u:link':
             camp = await active_campaign(uid)
             if camp:
-                await q.message.reply_text(f'🔗 <b>Ton lien personnel</b>\n\n<code>{camp.invite_link}</code>', parse_mode=ParseMode.HTML)
+                link, repaired, reason = await ensure_campaign_invite_link(context.bot, camp)
+                if link:
+                    prefix = '🔧 <b>Ton ancien lien a été réparé automatiquement.</b>\n\n' if repaired else '🔗 <b>Ton lien personnel</b>\n\n'
+                    await q.message.reply_text(prefix + f'<code>{link}</code>', parse_mode=ParseMode.HTML)
+                else:
+                    await q.message.reply_text(f'⚠️ Ton lien ne peut pas être vérifié pour le moment : {reason}.')
             else:
                 await q.message.reply_text('Aucune campagne active.')
         else:
@@ -614,6 +818,16 @@ async def admin_callback(q, context, data: str) -> None:
         context.application.create_task(
             run_broadcast(context.bot, q.from_user.id, source[0], source[1]),
             name=f'broadcast-{q.from_user.id}',
+        )
+        return
+    if data == 'a:repairlinks':
+        await q.message.reply_text(
+            '🛠 <b>Audit global lancé.</b>\n\nLe bot vérifie toutes les campagnes actives, recrée les liens morts et envoie automatiquement le nouveau lien aux utilisateurs concernés.\n\nUn rapport complet sera envoyé ici à la fin.',
+            parse_mode=ParseMode.HTML,
+        )
+        context.application.create_task(
+            run_manual_link_repair(context.bot, q.from_user.id),
+            name=f'repair-links-{q.from_user.id}',
         )
         return
     if data == 'a:words':
@@ -1142,6 +1356,15 @@ async def send_health(message, context) -> None:
         lines.append(f'Utilisateurs libérés : {cleanup.get("sessions_repaired", 0)}')
         lines.append(f'Liens révoqués : {cleanup.get("links_revoked", 0)}')
         lines.append(f'Panneaux actualisés : {cleanup.get("users_notified", 0)}')
+    link_audit = context.application.bot_data.get('last_campaign_link_audit', {})
+    if link_audit:
+        lines.append('')
+        lines.append('🔗 Dernier contrôle des liens de campagne')
+        lines.append(f'Contrôlés : {link_audit.get("scanned", 0)}')
+        lines.append(f'Liens réparés : {link_audit.get("repaired", 0)}')
+        lines.append(f'Utilisateurs prévenus : {link_audit.get("notified", 0)}')
+        lines.append(f'Groupes à vérifier : {link_audit.get("group_errors", 0)}')
+        lines.append(f'Erreurs : {link_audit.get("errors", 0)}')
     rec = context.application.bot_data.get('last_lost_reconciliation', {})
     if rec:
         lines.append('')
@@ -1244,7 +1467,9 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(cleanup_expired_vip_links, interval=30, first=3, name='cleanup_expired_vip_links')
     app.job_queue.run_repeating(audit_vip_members, interval=300, first=120, name='audit_vip_members')
     app.job_queue.run_repeating(health_watch, interval=settings.health_interval_minutes * 60, first=30, name='health_watch')
+    app.job_queue.run_repeating(campaign_link_watch, interval=settings.campaign_link_audit_minutes * 60, first=90, name='campaign_link_watch')
     app.job_queue.run_once(reconcile_lost_groups, when=8, name='reconcile_lost_groups_startup')
+    app.job_queue.run_once(startup_campaign_link_repair, when=20, name='startup_campaign_link_repair')
 
 
 def build() -> Application:

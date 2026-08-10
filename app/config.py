@@ -23,6 +23,8 @@ class Settings:
     broadcast_delay_seconds: float = float(os.environ.get('BROADCAST_DELAY_SECONDS', '0.05'))
     trend_drop_percent: float = float(os.environ.get('TREND_DROP_PERCENT', '20'))
     timezone: str = os.environ.get('TIMEZONE', 'Europe/Paris')
+    campaign_link_audit_minutes: int = int(os.environ.get('CAMPAIGN_LINK_AUDIT_MINUTES', '10'))
+    campaign_link_audit_batch: int = int(os.environ.get('CAMPAIGN_LINK_AUDIT_BATCH', '100'))
 
     def validate(self) -> None:
         missing = []
