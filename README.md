@@ -101,3 +101,9 @@ BROADCAST_DELAY_SECONDS=0.05
 Au démarrage, le bot recherche globalement les anciennes sessions `link_created` dont le lien est expiré. Elles sont marquées `expired`, les liens sont révoqués lorsque possible et les utilisateurs concernés reçoivent automatiquement un panneau actualisé. Ils n'ont pas besoin de refaire `/start`.
 
 Le même contrôle est relancé toutes les 30 secondes. Le bouton `🩺 SANTÉ` affiche le dernier bilan de cette correction.
+
+## Réparation automatique des liens de campagne (V5.2)
+
+Le panneau administrateur contient `🛠 RÉPARER LES LIENS`. Ce bouton audite toutes les campagnes actives, vérifie leurs liens de parrainage auprès de Telegram, recrée les liens devenus invalides et envoie automatiquement le nouveau lien aux utilisateurs concernés. Les compteurs, minutes et invitations sont conservés.
+
+Le même contrôle est exécuté automatiquement au démarrage puis en continu par lots. Les variables `CAMPAIGN_LINK_AUDIT_MINUTES` et `CAMPAIGN_LINK_AUDIT_BATCH` règlent la fréquence et la taille de chaque lot. Le bouton utilisateur `🔗 MON LIEN` effectue également une vérification à la demande avant d'afficher le lien.
