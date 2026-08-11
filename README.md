@@ -107,3 +107,21 @@ Le même contrôle est relancé toutes les 30 secondes. Le bouton `🩺 SANTÉ` 
 Le panneau administrateur contient `🛠 RÉPARER LES LIENS`. Ce bouton audite toutes les campagnes actives, vérifie leurs liens de parrainage auprès de Telegram, recrée les liens devenus invalides et envoie automatiquement le nouveau lien aux utilisateurs concernés. Les compteurs, minutes et invitations sont conservés.
 
 Le même contrôle est exécuté automatiquement au démarrage puis en continu par lots. Les variables `CAMPAIGN_LINK_AUDIT_MINUTES` et `CAMPAIGN_LINK_AUDIT_BATCH` règlent la fréquence et la taille de chaque lot. Le bouton utilisateur `🔗 MON LIEN` effectue également une vérification à la demande avant d'afficher le lien.
+
+## V5.3 — sécurité des liens de parrainage
+
+Les liens de campagne sont maintenant versionnés dans `campaign_invite_links`. Lorsqu'un lien est renouvelé, l'ancien n'est pas automatiquement révoqué : s'il avait déjà été partagé et fonctionne encore, toute nouvelle entrée via cet ancien lien reste attribuée à la même campagne.
+
+Le panneau admin contient **♻️ RENOUVELER TOUS**. Il affiche d'abord le nombre de campagnes actives, demande confirmation, crée un nouveau lien sans expiration pour chaque campagne, met à jour le lien courant et envoie le nouveau lien aux utilisateurs. Un rapport final indique le nombre de liens créés, les utilisateurs prévenus et les erreurs.
+
+`MON LIEN` renouvelle automatiquement un lien courant trop ancien. En plus, une rotation préventive s'exécute en arrière-plan pour éviter de conserver indéfiniment une URL courante.
+
+Variables :
+
+```env
+CAMPAIGN_LINK_REFRESH_MINUTES=30
+CAMPAIGN_LINK_MAX_AGE_HOURS=168
+CAMPAIGN_LINK_ROTATION_BATCH=100
+```
+
+La table `campaign_invite_links` est créée automatiquement au premier démarrage de cette version, puis les liens existants sont importés sans toucher aux campagnes ou aux compteurs.
