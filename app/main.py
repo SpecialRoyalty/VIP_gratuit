@@ -13,8 +13,8 @@ from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, C
 
 from .config import settings
 from .db import SessionLocal, engine, init_db
-from .keyboards import admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, pending_group, start_campaign, user_menu, vip_confirm
-from .models import Admin, Campaign, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
+from .keyboards import admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, pending_group, rotate_all_confirm, start_campaign, user_menu, vip_confirm
+from .models import Admin, Campaign, CampaignInviteLink, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
 from .services import active_campaign, active_session, bot_rights, ensure_user, forbidden_match, is_admin, now, public_group_link, record, remaining_minutes, token
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -58,12 +58,155 @@ async def _safe_revoke(bot, chat_id: int, invite_link: str | None) -> bool:
         return False
 
 
-async def ensure_campaign_invite_link(bot, campaign: Campaign, *, notify_user: bool = False) -> tuple[str | None, bool, str]:
-    """Vérifie le lien de parrainage d'une campagne et le remplace s'il est mort.
+async def backfill_campaign_link_history() -> int:
+    """Ajoute les liens déjà présents dans ``campaigns`` à l'historique V5.3.
 
-    Retourne ``(link, repaired, reason)``. La campagne, ses compteurs et ses minutes
-    sont toujours conservés. Un groupe PUB indisponible n'est jamais remplacé ici :
-    sa gestion reste celle de la réconciliation des groupes perdus.
+    Cette migration est volontairement sans destruction : aucune campagne, aucun
+    compteur et aucun ancien lien n'est supprimé.
+    """
+    added = 0
+    async with SessionLocal() as sdb:
+        campaigns = list((await sdb.scalars(select(Campaign))).all())
+        for camp in campaigns:
+            existing = await sdb.scalar(select(CampaignInviteLink).where(
+                CampaignInviteLink.invite_link == camp.invite_link
+            ))
+            if existing:
+                if camp.status == CampaignStatus.active:
+                    existing.is_current = True
+                continue
+            sdb.add(CampaignInviteLink(
+                campaign_id=camp.id,
+                invite_link=camp.invite_link,
+                is_current=(camp.status == CampaignStatus.active),
+                created_at=camp.created_at,
+            ))
+            added += 1
+        await sdb.commit()
+    return added
+
+
+async def _current_campaign_link_row(campaign_id: int) -> CampaignInviteLink | None:
+    async with SessionLocal() as sdb:
+        return await sdb.scalar(
+            select(CampaignInviteLink)
+            .where(CampaignInviteLink.campaign_id == campaign_id, CampaignInviteLink.is_current.is_(True))
+            .order_by(CampaignInviteLink.id.desc())
+        )
+
+
+async def rotate_campaign_invite_link(
+    bot,
+    campaign_id: int,
+    *,
+    notify_user: bool = False,
+    notification_title: str = '🔗 <b>Ton lien personnel a été actualisé.</b>',
+) -> tuple[str | None, bool, str]:
+    """Crée un nouveau lien permanent sans casser les anciens partages.
+
+    L'ancien lien est conservé dans ``campaign_invite_links``. S'il fonctionne
+    toujours et a déjà été partagé, les nouvelles arrivées via cet ancien lien
+    continueront donc d'être attribuées à la même campagne.
+    """
+    async with SessionLocal() as sdb:
+        camp = await sdb.get(Campaign, campaign_id)
+        if not camp or camp.status != CampaignStatus.active:
+            return None, False, 'campagne inactive'
+        group = await sdb.get(Group, camp.pub_group_id)
+        if not group or group.role != GroupRole.pub or not group.authorized:
+            return None, False, 'groupe PUB indisponible'
+        user_id = camp.user_id
+        pub_group_id = camp.pub_group_id
+
+    ok, reason = await bot_rights(bot, pub_group_id)
+    if not ok:
+        return None, False, reason
+
+    try:
+        fresh = await bot.create_chat_invite_link(
+            chat_id=pub_group_id,
+            name=f'parrain-{user_id}'[:32],
+            expire_date=None,
+            member_limit=None,
+            creates_join_request=False,
+        )
+    except RetryAfter as exc:
+        await asyncio.sleep(float(exc.retry_after) + 0.5)
+        return None, False, 'limite Telegram pendant le renouvellement'
+    except TelegramError as exc:
+        return None, False, f'renouvellement impossible : {exc}'
+
+    async with SessionLocal() as sdb:
+        camp = await sdb.get(Campaign, campaign_id)
+        if not camp or camp.status != CampaignStatus.active:
+            try:
+                await bot.revoke_chat_invite_link(pub_group_id, fresh.invite_link)
+            except TelegramError:
+                pass
+            return None, False, 'campagne fermée pendant le renouvellement'
+
+        old_rows = list((await sdb.scalars(select(CampaignInviteLink).where(
+            CampaignInviteLink.campaign_id == campaign_id,
+            CampaignInviteLink.is_current.is_(True),
+        ))).all())
+        for row in old_rows:
+            row.is_current = False
+            row.replaced_at = now()
+
+        # Sécurité pour les bases venant d'une ancienne version.
+        old_known = await sdb.scalar(select(CampaignInviteLink).where(
+            CampaignInviteLink.invite_link == camp.invite_link
+        ))
+        if not old_known:
+            sdb.add(CampaignInviteLink(
+                campaign_id=camp.id,
+                invite_link=camp.invite_link,
+                is_current=False,
+                created_at=camp.created_at,
+                replaced_at=now(),
+            ))
+
+        sdb.add(CampaignInviteLink(
+            campaign_id=camp.id,
+            invite_link=fresh.invite_link,
+            is_current=True,
+            created_at=now(),
+            last_checked_at=now(),
+        ))
+        camp.invite_link = fresh.invite_link
+        camp.updated_at = now()
+        await sdb.commit()
+
+    notified = False
+    if notify_user:
+        try:
+            await bot.send_message(
+                user_id,
+                notification_title + '\n\n'
+                'Utilise désormais ce lien pour tes nouveaux partages. '
+                'Ton compteur et tes minutes restent inchangés.\n\n'
+                f'<code>{fresh.invite_link}</code>',
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            notified = True
+        except TelegramError:
+            pass
+    return fresh.invite_link, notified, 'nouveau lien permanent créé'
+
+
+async def ensure_campaign_invite_link(
+    bot,
+    campaign: Campaign,
+    *,
+    notify_user: bool = False,
+    refresh_if_old: bool = False,
+) -> tuple[str | None, bool, str]:
+    """Retourne un lien de campagne sûr et renouvelle si nécessaire.
+
+    ``refresh_if_old`` est utilisé par « MON LIEN » : si le lien courant a plus
+    de ``CAMPAIGN_LINK_REFRESH_MINUTES``, on crée directement un nouveau lien à
+    partir de Telegram au lieu de faire confiance à une ancienne URL stockée.
     """
     async with SessionLocal() as sdb:
         camp = await sdb.get(Campaign, campaign.id)
@@ -75,15 +218,34 @@ async def ensure_campaign_invite_link(bot, campaign: Campaign, *, notify_user: b
         old_link = camp.invite_link
         user_id = camp.user_id
         pub_group_id = camp.pub_group_id
+        row = await sdb.scalar(
+            select(CampaignInviteLink)
+            .where(CampaignInviteLink.campaign_id == camp.id, CampaignInviteLink.is_current.is_(True))
+            .order_by(CampaignInviteLink.id.desc())
+        )
+        if not row:
+            row = CampaignInviteLink(
+                campaign_id=camp.id, invite_link=old_link, is_current=True,
+                created_at=camp.created_at,
+            )
+            sdb.add(row)
+            await sdb.commit()
 
     ok, rights_reason = await bot_rights(bot, pub_group_id)
     if not ok:
         return None, False, rights_reason
 
-    # Telegram ne fournit pas de méthode « get invite link ». Éditer le lien
-    # supplémentaire créé par le bot sert ici de contrôle d'existence. Nous
-    # conservons les paramètres de nos liens de campagne (pas d'expiration,
-    # pas de limite de membres) et leur nom déterministe.
+    if refresh_if_old:
+        age = now() - row.created_at
+        if age >= timedelta(minutes=max(0, settings.campaign_link_refresh_minutes)):
+            link, _, reason = await rotate_campaign_invite_link(
+                bot, campaign.id, notify_user=notify_user,
+                notification_title='🔧 <b>Ton lien personnel a été sécurisé.</b>',
+            )
+            return link, bool(link), reason
+
+    # L'API ne propose pas de « test de clic ». On utilise l'édition comme audit
+    # du lien créé par le bot ; si Telegram le refuse, on le remplace.
     try:
         checked = await bot.edit_chat_invite_link(
             chat_id=pub_group_id,
@@ -93,52 +255,35 @@ async def ensure_campaign_invite_link(bot, campaign: Campaign, *, notify_user: b
             member_limit=None,
             creates_join_request=False,
         )
+        async with SessionLocal() as sdb:
+            link_row = await sdb.scalar(select(CampaignInviteLink).where(
+                CampaignInviteLink.invite_link == old_link
+            ))
+            if link_row:
+                link_row.last_checked_at = now()
+                link_row.last_error = None
+                link_row.revoked = bool(checked.is_revoked)
+                await sdb.commit()
         if not checked.is_revoked:
             return checked.invite_link, False, 'OK'
     except RetryAfter as exc:
         await asyncio.sleep(float(exc.retry_after) + 0.5)
         return None, False, 'limite Telegram, nouvel essai nécessaire'
-    except TelegramError:
-        # Le groupe et les droits ont déjà été vérifiés. Si Telegram refuse le
-        # lien stocké, on le considère comme inutilisable et on le remplace.
-        pass
-
-    try:
-        fresh = await bot.create_chat_invite_link(
-            chat_id=pub_group_id,
-            name=f'parrain-{user_id}'[:32],
-        )
-    except RetryAfter as exc:
-        await asyncio.sleep(float(exc.retry_after) + 0.5)
-        return None, False, 'limite Telegram pendant la recréation'
     except TelegramError as exc:
-        return None, False, f'recréation impossible : {exc}'
+        async with SessionLocal() as sdb:
+            link_row = await sdb.scalar(select(CampaignInviteLink).where(
+                CampaignInviteLink.invite_link == old_link
+            ))
+            if link_row:
+                link_row.last_checked_at = now()
+                link_row.last_error = str(exc)
+                await sdb.commit()
 
-    async with SessionLocal() as sdb:
-        camp = await sdb.get(Campaign, campaign.id)
-        if not camp or camp.status != CampaignStatus.active:
-            try:
-                await bot.revoke_chat_invite_link(pub_group_id, fresh.invite_link)
-            except TelegramError:
-                pass
-            return None, False, 'campagne fermée pendant la réparation'
-        camp.invite_link = fresh.invite_link
-        camp.updated_at = now()
-        await sdb.commit()
-
-    if notify_user:
-        try:
-            await bot.send_message(
-                user_id,
-                '🔧 <b>Ton lien personnel a été réparé.</b>\n\n'
-                'Un ancien lien n’était plus utilisable. Ton compteur et tes minutes ont été conservés.\n\n'
-                f'🔗 <code>{fresh.invite_link}</code>',
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-        except TelegramError:
-            pass
-    return fresh.invite_link, True, 'lien recréé'
+    link, _, reason = await rotate_campaign_invite_link(
+        bot, campaign.id, notify_user=notify_user,
+        notification_title='🔧 <b>Ton ancien lien a été réparé.</b>',
+    )
+    return link, bool(link), reason
 
 
 async def repair_campaign_links(bot, *, notify_users: bool, limit: int | None = None, after_id: int = 0) -> dict[str, int]:
@@ -210,6 +355,97 @@ async def run_manual_link_repair(bot, admin_id: int) -> None:
         )
     except TelegramError:
         pass
+
+
+async def rotate_all_campaign_links(bot, admin_id: int) -> None:
+    """Rotation forcée de tous les liens courants avec rapport administrateur."""
+    stats = {'total': 0, 'rotated': 0, 'notified': 0, 'group_errors': 0, 'errors': 0}
+    async with SessionLocal() as sdb:
+        campaigns = list((await sdb.scalars(
+            select(Campaign).where(Campaign.status == CampaignStatus.active).order_by(Campaign.id.asc())
+        )).all())
+    stats['total'] = len(campaigns)
+
+    for camp in campaigns:
+        link, notified, reason = await rotate_campaign_invite_link(
+            bot,
+            camp.id,
+            notify_user=True,
+            notification_title='♻️ <b>Ton lien personnel a été renouvelé.</b>',
+        )
+        if link:
+            stats['rotated'] += 1
+            stats['notified'] += int(notified)
+        elif 'groupe' in reason.casefold() or 'administrateur' in reason.casefold() or 'droit' in reason.casefold():
+            stats['group_errors'] += 1
+        else:
+            stats['errors'] += 1
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            admin_id,
+            '♻️ <b>Renouvellement global terminé</b>\n\n'
+            f'Campagnes actives : <b>{stats["total"]}</b>\n'
+            f'Nouveaux liens créés : <b>{stats["rotated"]}</b>\n'
+            f'Utilisateurs prévenus : <b>{stats["notified"]}</b>\n'
+            f'Groupes à vérifier : <b>{stats["group_errors"]}</b>\n'
+            f'Autres erreurs : <b>{stats["errors"]}</b>\n\n'
+            'Les anciens liens ne sont pas révoqués automatiquement : s’ils sont encore '
+            'fonctionnels et déjà partagés, ils continuent à créditer la même campagne.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
+    except TelegramError:
+        pass
+
+
+async def rotate_stale_campaign_links(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Rotation préventive des liens trop anciens, par petits lots.
+
+    C'est la protection long terme : un lien courant n'est jamais conservé au-delà
+    de CAMPAIGN_LINK_MAX_AGE_HOURS sans qu'un nouveau lien Telegram soit créé.
+    """
+    cutoff = now() - timedelta(hours=max(1, settings.campaign_link_max_age_hours))
+    batch = max(1, settings.campaign_link_rotation_batch)
+    async with SessionLocal() as sdb:
+        rows = list((await sdb.scalars(
+            select(CampaignInviteLink)
+            .join(Campaign, Campaign.id == CampaignInviteLink.campaign_id)
+            .where(
+                Campaign.status == CampaignStatus.active,
+                CampaignInviteLink.is_current.is_(True),
+                CampaignInviteLink.created_at <= cutoff,
+            )
+            .order_by(CampaignInviteLink.created_at.asc())
+            .limit(batch)
+        )).all())
+
+    stats = {'scanned': len(rows), 'rotated': 0, 'notified': 0, 'errors': 0}
+    for row in rows:
+        link, notified, _ = await rotate_campaign_invite_link(
+            context.bot,
+            row.campaign_id,
+            notify_user=True,
+            notification_title='🔄 <b>Ton lien personnel a été renouvelé automatiquement.</b>',
+        )
+        if link:
+            stats['rotated'] += 1
+            stats['notified'] += int(notified)
+        else:
+            stats['errors'] += 1
+        await asyncio.sleep(0.05)
+
+    context.application.bot_data['last_campaign_link_rotation'] = stats
+    if stats['rotated'] or stats['errors']:
+        await notify_admins(
+            context.bot,
+            '♻️ <b>Rotation préventive des liens</b>\n\n'
+            f'Liens arrivés à échéance interne : {stats["scanned"]}\n'
+            f'Nouveaux liens : {stats["rotated"]}\n'
+            f'Utilisateurs prévenus : {stats["notified"]}\n'
+            f'Erreurs : {stats["errors"]}',
+        )
 
 
 async def campaign_link_watch(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -292,7 +528,18 @@ async def release_lost_pub_group(bot, group_id: int, reason: str) -> dict[str, i
             camp.pending_invites = 0
             stats['campaigns'] += 1
             notifications.append(camp.user_id)
-            revoke_campaign_links.append(camp.invite_link)
+            history_links = list((await sdb.scalars(select(CampaignInviteLink).where(
+                CampaignInviteLink.campaign_id == camp.id,
+                CampaignInviteLink.revoked.is_(False),
+            ))).all())
+            if history_links:
+                for history_link in history_links:
+                    revoke_campaign_links.append(history_link.invite_link)
+                    history_link.is_current = False
+                    history_link.revoked = True
+                    history_link.replaced_at = now()
+            else:
+                revoke_campaign_links.append(camp.invite_link)
 
             pending = list((await sdb.scalars(select(Invite).where(
                 Invite.campaign_id == camp.id, Invite.status == InviteStatus.pending
@@ -325,7 +572,7 @@ async def release_lost_pub_group(bot, group_id: int, reason: str) -> dict[str, i
         group.health_error = f'groupe perdu : {reason}'
         await sdb.commit()
 
-    for link in revoke_campaign_links:
+    for link in set(revoke_campaign_links):
         stats['links'] += int(await _safe_revoke(bot, group_id, link))
     for chat_id, link in revoke_trial_links + revoke_vip_links:
         stats['links'] += int(await _safe_revoke(bot, chat_id, link))
@@ -535,6 +782,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 sdb.add(camp)
                 await sdb.flush()
+                sdb.add(CampaignInviteLink(
+                    campaign_id=camp.id, invite_link=ref.invite_link,
+                    is_current=True, created_at=now(), last_checked_at=now(),
+                ))
                 sdb.add(
                     MetricEvent(
                         event_type=EventType.campaign_started,
@@ -655,6 +906,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         async with SessionLocal() as s:
             camp = Campaign(user_id=uid, pub_group_id=group_id, vip_group_id=group.vip_group_id, invite_link=link.invite_link)
             s.add(camp)
+            await s.flush()
+            s.add(CampaignInviteLink(
+                campaign_id=camp.id, invite_link=link.invite_link,
+                is_current=True, created_at=now(), last_checked_at=now(),
+            ))
             s.add(MetricEvent(event_type=EventType.campaign_started, pub_group_id=group_id, ad_version=group.ad_version, user_id=uid))
             await s.commit()
         await q.message.reply_text(f'✅ <b>Ton lien personnel est prêt !</b>\n\n<code>{link.invite_link}</code>\n\nChaque invitation validée ajoute une minute.', parse_mode=ParseMode.HTML, reply_markup=user_menu(False, settings.minimum_minutes))
@@ -664,7 +920,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data == 'u:link':
             camp = await active_campaign(uid)
             if camp:
-                link, repaired, reason = await ensure_campaign_invite_link(context.bot, camp)
+                link, repaired, reason = await ensure_campaign_invite_link(context.bot, camp, refresh_if_old=True)
                 if link:
                     prefix = '🔧 <b>Ton ancien lien a été réparé automatiquement.</b>\n\n' if repaired else '🔗 <b>Ton lien personnel</b>\n\n'
                     await q.message.reply_text(prefix + f'<code>{link}</code>', parse_mode=ParseMode.HTML)
@@ -830,6 +1086,31 @@ async def admin_callback(q, context, data: str) -> None:
             name=f'repair-links-{q.from_user.id}',
         )
         return
+    if data == 'a:rotateall':
+        async with SessionLocal() as sdb:
+            count = int(await sdb.scalar(select(func.count(Campaign.id)).where(
+                Campaign.status == CampaignStatus.active
+            )) or 0)
+        await q.message.reply_text(
+            '♻️ <b>Renouveler tous les liens personnels ?</b>\n\n'
+            f'Campagnes actives concernées : <b>{count}</b>\n\n'
+            'Un nouveau lien permanent sera créé pour chaque campagne et envoyé à chaque utilisateur. '
+            'Les compteurs et les minutes resteront inchangés. Les anciens liens déjà partagés resteront '
+            'rattachés à la campagne afin de continuer à compter s’ils fonctionnent encore.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=rotate_all_confirm(count),
+        )
+        return
+    if data == 'a:rotateall:confirm':
+        await q.message.reply_text(
+            '♻️ Renouvellement lancé en arrière-plan. Tu recevras le bilan complet à la fin.',
+            reply_markup=admin_menu(),
+        )
+        context.application.create_task(
+            rotate_all_campaign_links(context.bot, q.from_user.id),
+            name=f'rotate-all-links-{q.from_user.id}',
+        )
+        return
     if data == 'a:words':
         async with SessionLocal() as s:
             rows = list((await s.scalars(select(ForbiddenWord).where(ForbiddenWord.active.is_(True)))).all())
@@ -953,8 +1234,19 @@ async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if group.role == GroupRole.pub and cmu.invite_link:
         async with SessionLocal() as sdb:
-            camp = await sdb.scalar(select(Campaign).where(Campaign.invite_link == cmu.invite_link.invite_link, Campaign.status == CampaignStatus.active))
-            if not camp or camp.user_id == user.id:
+            link_row = await sdb.scalar(select(CampaignInviteLink).where(
+                CampaignInviteLink.invite_link == cmu.invite_link.invite_link,
+                CampaignInviteLink.revoked.is_(False),
+            ))
+            camp = await sdb.get(Campaign, link_row.campaign_id) if link_row else None
+            # Compatibilité avec les campagnes créées avant la V5.3 si le backfill
+            # n'a pas encore eu le temps de s'exécuter.
+            if not camp:
+                camp = await sdb.scalar(select(Campaign).where(
+                    Campaign.invite_link == cmu.invite_link.invite_link,
+                    Campaign.status == CampaignStatus.active,
+                ))
+            if not camp or camp.status != CampaignStatus.active or camp.user_id == user.id:
                 return
             exists = await sdb.scalar(select(Invite).where(Invite.joined_user_id == user.id))
             if exists:
@@ -1365,6 +1657,15 @@ async def send_health(message, context) -> None:
         lines.append(f'Utilisateurs prévenus : {link_audit.get("notified", 0)}')
         lines.append(f'Groupes à vérifier : {link_audit.get("group_errors", 0)}')
         lines.append(f'Erreurs : {link_audit.get("errors", 0)}')
+    rotation = context.application.bot_data.get('last_campaign_link_rotation', {})
+    if rotation:
+        lines.append('')
+        lines.append('♻️ Dernière rotation préventive')
+        lines.append(f'Liens examinés : {rotation.get("scanned", 0)}')
+        lines.append(f'Nouveaux liens : {rotation.get("rotated", 0)}')
+        lines.append(f'Utilisateurs prévenus : {rotation.get("notified", 0)}')
+        lines.append(f'Erreurs : {rotation.get("errors", 0)}')
+    lines.append(f'🛡 Âge maximum du lien courant : {settings.campaign_link_max_age_hours} h')
     rec = context.application.bot_data.get('last_lost_reconciliation', {})
     if rec:
         lines.append('')
@@ -1457,6 +1758,9 @@ async def send_global_stats(message) -> None:
 
 async def post_init(app: Application) -> None:
     settings.validate(); await init_db()
+    backfilled = await backfill_campaign_link_history()
+    if backfilled:
+        log.info('Historique des liens de campagne initialisé : %s lien(s)', backfilled)
     async with SessionLocal() as s:
         for uid in settings.owner_ids:
             if not await s.get(Admin, uid): s.add(Admin(telegram_id=uid, source='owner'))
@@ -1468,6 +1772,7 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(audit_vip_members, interval=300, first=120, name='audit_vip_members')
     app.job_queue.run_repeating(health_watch, interval=settings.health_interval_minutes * 60, first=30, name='health_watch')
     app.job_queue.run_repeating(campaign_link_watch, interval=settings.campaign_link_audit_minutes * 60, first=90, name='campaign_link_watch')
+    app.job_queue.run_repeating(rotate_stale_campaign_links, interval=settings.campaign_link_audit_minutes * 60, first=150, name='campaign_link_rotation_watch')
     app.job_queue.run_once(reconcile_lost_groups, when=8, name='reconcile_lost_groups_startup')
     app.job_queue.run_once(startup_campaign_link_repair, when=20, name='startup_campaign_link_repair')
 

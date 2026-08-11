@@ -124,6 +124,25 @@ class Campaign(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class CampaignInviteLink(Base):
+    """Historique des liens de parrainage d'une campagne.
+
+    On ne supprime pas les anciens liens lors d'une rotation : s'ils sont encore
+    utilisables et ont déjà été partagés, une arrivée via ces liens continue
+    d'être attribuée à la bonne campagne.
+    """
+    __tablename__ = 'campaign_invite_links'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, ForeignKey('campaigns.id'), index=True)
+    invite_link: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    replaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Invite(Base):
     __tablename__ = 'invites'
     __table_args__ = (UniqueConstraint('joined_user_id', name='uq_invited_user_global'),)

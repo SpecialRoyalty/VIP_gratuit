@@ -6,7 +6,7 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton('🩺 SANTÉ', callback_data='a:health'), InlineKeyboardButton('📊 STATISTIQUES', callback_data='a:stats')],
         [InlineKeyboardButton('👥 GROUPES', callback_data='a:groups'), InlineKeyboardButton('🚫 MOTS INTERDITS', callback_data='a:words')],
         [InlineKeyboardButton('📣 BROADCAST PRIVÉ', callback_data='a:broadcast')],
-        [InlineKeyboardButton('🛠 RÉPARER LES LIENS', callback_data='a:repairlinks')],
+        [InlineKeyboardButton('🔎 AUDITER LES LIENS', callback_data='a:repairlinks'), InlineKeyboardButton('♻️ RENOUVELER TOUS', callback_data='a:rotateall')],
     ])
 
 
@@ -71,4 +71,11 @@ def broadcast_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton('✅ ENVOYER À TOUS', callback_data='a:broadcast:send')],
         [InlineKeyboardButton('❌ ANNULER', callback_data='a:broadcast:cancel')],
+    ])
+
+
+def rotate_all_confirm(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f'✅ RENOUVELER {count} LIENS', callback_data='a:rotateall:confirm')],
+        [InlineKeyboardButton('❌ ANNULER', callback_data='a:menu')],
     ])
