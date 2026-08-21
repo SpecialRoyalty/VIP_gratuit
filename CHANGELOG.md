@@ -12,3 +12,10 @@
 - Les groupes PUB perdus révoquent désormais tous les liens historiques connus de leurs campagnes.
 - Santé enrichie avec le dernier bilan de rotation préventive et l'âge maximum configuré.
 - Backfill automatique de l'historique au démarrage : aucune suppression de base ni migration manuelle nécessaire.
+
+## V5.4 — Gestion manuelle des groupes PUB
+- Ajout de **⏸ DÉSACTIVER** : empêche les nouvelles campagnes tout en conservant les campagnes existantes.
+- Ajout de **▶️ RÉACTIVER** avec contrôle préalable des droits Telegram du bot.
+- Ajout de **🗑 SUPPRIMER & LIBÉRER** avec écran de confirmation et comptage des campagnes, invitations en attente et liens actifs.
+- Lors d'une suppression : clôture des campagnes actives, révocation des liens de campagne, annulation des invitations en attente, annulation des liens VIP/découverte non utilisés, notification des utilisateurs, archivage du groupe puis déconnexion du bot.
+- L'opération est idempotente et conserve les anciennes données pour les statistiques.

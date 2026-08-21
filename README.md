@@ -125,3 +125,12 @@ CAMPAIGN_LINK_ROTATION_BATCH=100
 ```
 
 La table `campaign_invite_links` est créée automatiquement au premier démarrage de cette version, puis les liens existants sont importés sans toucher aux campagnes ou aux compteurs.
+
+## Suppression manuelle d'un groupe PUB (V5.4)
+Dans **👥 GROUPES**, ouvrir un groupe PUB puis choisir :
+
+- **⏸ DÉSACTIVER** : bloque seulement les nouvelles campagnes ; les campagnes déjà actives continuent.
+- **▶️ RÉACTIVER** : remet le groupe en service après vérification des droits du bot.
+- **🗑 SUPPRIMER & LIBÉRER** : affiche un bilan avant confirmation, puis clôture toutes les campagnes actives du groupe, révoque leurs liens, annule les invitations en attente, libère les utilisateurs et débranche le bot du groupe.
+
+Les utilisateurs libérés n'ont aucune action spéciale à faire : leur prochain clic sur **🎁 VIP GRATUIT** depuis un autre groupe PUB crée automatiquement une nouvelle campagne.
