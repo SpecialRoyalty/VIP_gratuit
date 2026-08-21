@@ -13,7 +13,7 @@ from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, C
 
 from .config import settings
 from .db import SessionLocal, engine, init_db
-from .keyboards import admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, pending_group, rotate_all_confirm, start_campaign, user_menu, vip_confirm
+from .keyboards import admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, delete_pub_confirm, pending_group, rotate_all_confirm, start_campaign, user_menu, vip_confirm
 from .models import Admin, Campaign, CampaignInviteLink, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
 from .services import active_campaign, active_session, bot_rights, ensure_user, forbidden_match, is_admin, now, public_group_link, record, remaining_minutes, token
 
@@ -983,7 +983,7 @@ async def admin_callback(q, context, data: str) -> None:
             g = await s.get(Group, gid)
         if not g: return
         if g.role == GroupRole.pub:
-            await q.message.reply_text(f'📢 <b>{g.title}</b>\nTexte : {"✅" if g.ad_text else "❌"}\nImage : {"✅" if g.ad_photo_file_id else "❌"}\nVIP associé : {"✅" if g.vip_group_id else "❌"}', parse_mode=ParseMode.HTML, reply_markup=manage_pub(gid))
+            await q.message.reply_text(f'📢 <b>{g.title}</b>\nTexte : {"✅" if g.ad_text else "❌"}\nImage : {"✅" if g.ad_photo_file_id else "❌"}\nVIP associé : {"✅" if g.vip_group_id else "❌"}', parse_mode=ParseMode.HTML, reply_markup=manage_pub(gid, g.authorized))
         elif g.role == GroupRole.pending:
             ok, reason = await bot_rights(context.bot, gid)
             await q.message.reply_text(f'⏳ {g.title}\nDroits : {reason}', reply_markup=pending_group(gid, ok))
@@ -993,6 +993,114 @@ async def admin_callback(q, context, data: str) -> None:
     if data.startswith('a:check:'):
         gid = int(data.split(':')[2]); ok, reason = await bot_rights(context.bot, gid)
         await q.message.reply_text(f'{"✅" if ok else "❌"} {reason}', reply_markup=pending_group(gid, ok)); return
+    if data.startswith('a:disablepub:'):
+        gid = int(data.split(':')[2])
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+            if not g or g.role != GroupRole.pub:
+                await q.message.reply_text('Groupe PUB introuvable.'); return
+            g.authorized = False
+            g.health_error = 'désactivé manuellement par un administrateur'
+            await s.commit()
+        await q.message.reply_text(
+            '⏸ <b>Groupe PUB désactivé.</b>\n\n'
+            'Aucune nouvelle campagne ne pourra démarrer depuis ce groupe.\n'
+            'Les campagnes existantes restent actives.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=manage_pub(gid, False),
+        )
+        return
+    if data.startswith('a:enablepub:'):
+        gid = int(data.split(':')[2])
+        ok, reason = await bot_rights(context.bot, gid)
+        if not ok:
+            await q.message.reply_text(f'❌ Réactivation impossible : {reason}'); return
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+            if not g or g.role != GroupRole.pub:
+                await q.message.reply_text('Groupe PUB introuvable.'); return
+            g.authorized = True
+            g.last_health_ok = True
+            g.health_error = None
+            g.last_seen_at = now()
+            await s.commit()
+        await q.message.reply_text(
+            '✅ <b>Groupe PUB réactivé.</b>',
+            parse_mode=ParseMode.HTML,
+            reply_markup=manage_pub(gid, True),
+        )
+        return
+    if data.startswith('a:deletepub:'):
+        gid = int(data.split(':')[2])
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+            if not g or g.role != GroupRole.pub:
+                await q.message.reply_text('Groupe PUB introuvable.'); return
+            campaign_count = int(await s.scalar(select(func.count(Campaign.id)).where(
+                Campaign.pub_group_id == gid, Campaign.status == CampaignStatus.active
+            )) or 0)
+            pending_count = int(await s.scalar(select(func.count(Invite.id)).join(
+                Campaign, Campaign.id == Invite.campaign_id
+            ).where(
+                Campaign.pub_group_id == gid,
+                Campaign.status == CampaignStatus.active,
+                Invite.status == InviteStatus.pending,
+            )) or 0)
+            link_count = int(await s.scalar(select(func.count(CampaignInviteLink.id)).join(
+                Campaign, Campaign.id == CampaignInviteLink.campaign_id
+            ).where(
+                Campaign.pub_group_id == gid,
+                Campaign.status == CampaignStatus.active,
+                CampaignInviteLink.revoked.is_(False),
+            )) or 0)
+            title = g.title
+        await q.message.reply_text(
+            '⚠️ <b>Suppression du groupe PUB</b>\n\n'
+            f'Groupe : <b>{title}</b>\n\n'
+            f'Campagnes actives : <b>{campaign_count}</b>\n'
+            f'Invitations en vérification : <b>{pending_count}</b>\n'
+            f'Liens personnels actifs : <b>{link_count}</b>\n\n'
+            'Cette opération va :\n'
+            '• désactiver définitivement ce groupe PUB ;\n'
+            '• révoquer ses liens de campagne ;\n'
+            '• clôturer ses campagnes actives ;\n'
+            '• annuler les invitations encore en attente ;\n'
+            f'• libérer <b>{campaign_count}</b> utilisateur(s) ;\n'
+            '• permettre à ces utilisateurs de recommencer automatiquement depuis un autre groupe PUB.\n\n'
+            'Les anciennes données restent archivées pour les statistiques.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=delete_pub_confirm(gid, campaign_count, pending_count, link_count),
+        )
+        return
+    if data.startswith('a:deletepubconfirm:'):
+        gid = int(data.split(':')[2])
+        async with SessionLocal() as s:
+            g = await s.get(Group, gid)
+            title = g.title if g else str(gid)
+            valid = bool(g and g.role == GroupRole.pub)
+        if not valid:
+            await q.message.reply_text('Ce groupe PUB n’existe plus ou a déjà été supprimé.', reply_markup=admin_menu()); return
+        result = await release_lost_pub_group(context.bot, gid, 'suppression manuelle par un administrateur')
+        # On se débranche seulement après avoir révoqué les liens, afin de garder les droits nécessaires.
+        left = True
+        try:
+            await context.bot.leave_chat(gid)
+        except TelegramError:
+            left = False
+        await q.message.reply_text(
+            '✅ <b>Groupe supprimé et utilisateurs libérés</b>\n\n'
+            f'Groupe : <b>{title}</b>\n'
+            f'Campagnes clôturées : <b>{result["campaigns"]}</b>\n'
+            f'Utilisateurs libérés : <b>{result["campaigns"]}</b>\n'
+            f'Liens révoqués : <b>{result["links"]}</b>\n'
+            f'Invitations annulées : <b>{result["invites"]}</b>\n'
+            f'Utilisateurs prévenus : <b>{result["users"]}</b>\n'
+            f'Déconnexion du groupe : <b>{"✅" if left else "⚠️ non confirmée"}</b>\n\n'
+            'Les utilisateurs concernés peuvent désormais démarrer automatiquement une nouvelle campagne depuis un autre groupe partenaire.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu(),
+        )
+        return
     if data.startswith('a:role:'):
         _, _, gid_s, role_s = data.split(':'); gid = int(gid_s)
         ok, reason = await bot_rights(context.bot, gid)
@@ -1130,12 +1238,12 @@ async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         async with SessionLocal() as s:
             g = await s.get(Group, gid); g.ad_text = update.message.text; g.ad_version += 1; await s.commit()
         context.user_data.pop('admin_input', None)
-        await update.message.reply_text('✅ Texte enregistré.', reply_markup=manage_pub(gid))
+        await update.message.reply_text('✅ Texte enregistré.', reply_markup=manage_pub(gid, g.authorized))
     elif kind == 'ad_photo' and update.message.photo:
         async with SessionLocal() as s:
             g = await s.get(Group, gid); g.ad_photo_file_id = update.message.photo[-1].file_id; g.ad_version += 1; await s.commit()
         context.user_data.pop('admin_input', None)
-        await update.message.reply_text('✅ Image enregistrée.', reply_markup=manage_pub(gid))
+        await update.message.reply_text('✅ Image enregistrée.', reply_markup=manage_pub(gid, g.authorized))
     elif kind == 'broadcast' and (update.message.text or update.message.photo):
         context.user_data['broadcast_source'] = (update.message.chat_id, update.message.message_id)
         async with SessionLocal() as s:

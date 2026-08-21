@@ -24,12 +24,29 @@ def pending_group(chat_id: int, can_configure: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def manage_pub(chat_id: int) -> InlineKeyboardMarkup:
+def manage_pub(chat_id: int, authorized: bool = True) -> InlineKeyboardMarkup:
+    state_button = (
+        InlineKeyboardButton('⏸ DÉSACTIVER', callback_data=f'a:disablepub:{chat_id}')
+        if authorized else
+        InlineKeyboardButton('▶️ RÉACTIVER', callback_data=f'a:enablepub:{chat_id}')
+    )
     return InlineKeyboardMarkup([
         [InlineKeyboardButton('📝 TEXTE PUB', callback_data=f'a:adtext:{chat_id}'), InlineKeyboardButton('🖼 IMAGE PUB', callback_data=f'a:adphoto:{chat_id}')],
         [InlineKeyboardButton('🔗 ASSOCIER VIP', callback_data=f'a:choosevip:{chat_id}'), InlineKeyboardButton('👁 PRÉVISUALISER', callback_data=f'a:preview:{chat_id}')],
         [InlineKeyboardButton('📢 PUBLIER', callback_data=f'a:publish:{chat_id}'), InlineKeyboardButton('📊 STATS GROUPE', callback_data=f'a:gstats:{chat_id}')],
+        [state_button],
+        [InlineKeyboardButton('🗑 SUPPRIMER & LIBÉRER', callback_data=f'a:deletepub:{chat_id}')],
         [InlineKeyboardButton('⬅️ GROUPES', callback_data='a:groups')],
+    ])
+
+
+def delete_pub_confirm(chat_id: int, campaign_count: int, pending_count: int, link_count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f'🗑 CONFIRMER — LIBÉRER {campaign_count}',
+            callback_data=f'a:deletepubconfirm:{chat_id}',
+        )],
+        [InlineKeyboardButton('❌ ANNULER', callback_data=f'a:g:{chat_id}')],
     ])
 
 
