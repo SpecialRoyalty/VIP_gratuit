@@ -223,3 +223,60 @@ class HealthAlert(Base):
     resolved: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ChallengeEnrollment(Base):
+    __tablename__ = 'challenge_enrollments'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.telegram_id'), index=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, ForeignKey('campaigns.id'), unique=True)
+    vip_group_id: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(24), default='enrolled', index=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submission_no: Mapped[int] = mapped_column(Integer, default=0)
+    submitted_evidence_count: Mapped[int] = mapped_column(Integer, default=0)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
+    review_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class ChallengeEvidence(Base):
+    __tablename__ = 'challenge_evidence'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    enrollment_id: Mapped[int] = mapped_column(Integer, ForeignKey('challenge_enrollments.id'), index=True)
+    text: Mapped[str | None] = mapped_column(Text)
+    photo_file_id: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class LifetimeAccess(Base):
+    __tablename__ = 'lifetime_accesses'
+    __table_args__ = (UniqueConstraint('user_id', 'vip_group_id', name='uq_lifetime_user_group'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.telegram_id'), index=True)
+    vip_group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    enrollment_id: Mapped[int] = mapped_column(Integer, ForeignKey('challenge_enrollments.id'), unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    granted_by: Mapped[int] = mapped_column(BigInteger)
+    invite_link: Mapped[str | None] = mapped_column(Text)
+    invite_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ReleaseNotice(Base):
+    __tablename__ = 'release_notices'
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    audience_cutoff: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ReleaseNoticeDelivery(Base):
+    __tablename__ = 'release_notice_deliveries'
+    __table_args__ = (UniqueConstraint('notice_key', 'user_id', name='uq_release_notice_user'),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    notice_key: Mapped[str] = mapped_column(String(64), ForeignKey('release_notices.key'), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey('users.telegram_id'))
+    status: Mapped[str] = mapped_column(String(24), default='pending', index=True)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)

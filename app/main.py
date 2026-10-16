@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import hashlib
+from html import escape
 from datetime import timedelta
 
 from sqlalchemy import and_, func, or_, select
@@ -12,9 +14,11 @@ from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import settings
+from . import challenges, announcements
+from .ranks import rank_for, rank_summary, rank_rules, total_valid_invites
 from .db import SessionLocal, engine, init_db
-from .keyboards import admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, delete_pub_confirm, pending_group, rotate_all_confirm, start_campaign, user_menu, vip_confirm
-from .models import Admin, Campaign, CampaignInviteLink, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
+from .keyboards import admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, delete_pub_confirm, pending_group, start_campaign, user_menu, vip_confirm
+from .models import Admin, ChallengeEnrollment, Campaign, CampaignInviteLink, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
 from .services import active_campaign, active_session, bot_rights, ensure_user, forbidden_match, is_admin, now, public_group_link, record, remaining_minutes, token
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -42,8 +46,8 @@ def _connection_loss_reason(reason: str) -> bool:
     """Évite de confondre une mauvaise configuration avec un groupe réellement perdu."""
     value = (reason or '').casefold()
     permanent_markers = (
-        'chat not found', 'bot is not a member', 'not a member', 'forbidden',
-        'kicked', 'banned', 'bot retiré', 'le bot n’est pas administrateur',
+        'chat not found', 'bot is not a member', 'not a member',
+        'bot was kicked', 'bot was banned', 'bot retiré',
     )
     return any(marker in value for marker in permanent_markers)
 
@@ -86,411 +90,162 @@ async def backfill_campaign_link_history() -> int:
     return added
 
 
-async def _current_campaign_link_row(campaign_id: int) -> CampaignInviteLink | None:
+# Les audits partagent un verrou pour éviter les alertes et appels en double.
+_campaign_audit_lock = asyncio.Lock()
+_campaign_audit_retry_at = None
+
+
+async def create_permanent_campaign_link(bot, group_id: int, user_id: int):
+    """Un seul lien de parrainage, sans date d'expiration ni quota de membres."""
+    return await bot.create_chat_invite_link(
+        chat_id=group_id,
+        name=f'parrain-{user_id}'[:32],
+        expire_date=None,
+        member_limit=None,
+        creates_join_request=False,
+    )
+
+
+async def report_campaign_link_check(bot, campaign, group, reason: str | None) -> None:
+    """Conserve l'erreur exacte et déduplique les alertes, même après redémarrage."""
+    current = now()
+    prefix = f'campaign-link:{campaign.id}:'
+    fingerprint = prefix + hashlib.sha256((reason or '').encode()).hexdigest()
+    alert_needed = False
     async with SessionLocal() as sdb:
-        return await sdb.scalar(
-            select(CampaignInviteLink)
-            .where(CampaignInviteLink.campaign_id == campaign_id, CampaignInviteLink.is_current.is_(True))
-            .order_by(CampaignInviteLink.id.desc())
-        )
-
-
-async def rotate_campaign_invite_link(
-    bot,
-    campaign_id: int,
-    *,
-    notify_user: bool = False,
-    notification_title: str = '🔗 <b>Ton lien personnel a été actualisé.</b>',
-) -> tuple[str | None, bool, str]:
-    """Crée un nouveau lien permanent sans casser les anciens partages.
-
-    L'ancien lien est conservé dans ``campaign_invite_links``. S'il fonctionne
-    toujours et a déjà été partagé, les nouvelles arrivées via cet ancien lien
-    continueront donc d'être attribuées à la même campagne.
-    """
-    async with SessionLocal() as sdb:
-        camp = await sdb.get(Campaign, campaign_id)
-        if not camp or camp.status != CampaignStatus.active:
-            return None, False, 'campagne inactive'
-        group = await sdb.get(Group, camp.pub_group_id)
-        if not group or group.role != GroupRole.pub or not group.authorized:
-            return None, False, 'groupe PUB indisponible'
-        user_id = camp.user_id
-        pub_group_id = camp.pub_group_id
-
-    ok, reason = await bot_rights(bot, pub_group_id)
-    if not ok:
-        return None, False, reason
-
-    try:
-        fresh = await bot.create_chat_invite_link(
-            chat_id=pub_group_id,
-            name=f'parrain-{user_id}'[:32],
-            expire_date=None,
-            member_limit=None,
-            creates_join_request=False,
-        )
-    except RetryAfter as exc:
-        await asyncio.sleep(float(exc.retry_after) + 0.5)
-        return None, False, 'limite Telegram pendant le renouvellement'
-    except TelegramError as exc:
-        return None, False, f'renouvellement impossible : {exc}'
-
-    async with SessionLocal() as sdb:
-        camp = await sdb.get(Campaign, campaign_id)
-        if not camp or camp.status != CampaignStatus.active:
-            try:
-                await bot.revoke_chat_invite_link(pub_group_id, fresh.invite_link)
-            except TelegramError:
-                pass
-            return None, False, 'campagne fermée pendant le renouvellement'
-
-        old_rows = list((await sdb.scalars(select(CampaignInviteLink).where(
-            CampaignInviteLink.campaign_id == campaign_id,
-            CampaignInviteLink.is_current.is_(True),
+        row = await sdb.scalar(select(CampaignInviteLink).where(
+            CampaignInviteLink.invite_link == campaign.invite_link
+        ))
+        if row:
+            row.last_checked_at = current
+            row.last_error = reason
+        alerts = list((await sdb.scalars(select(HealthAlert).where(
+            HealthAlert.fingerprint.startswith(prefix), HealthAlert.resolved.is_(False)
         ))).all())
-        for row in old_rows:
-            row.is_current = False
-            row.replaced_at = now()
-
-        # Sécurité pour les bases venant d'une ancienne version.
-        old_known = await sdb.scalar(select(CampaignInviteLink).where(
-            CampaignInviteLink.invite_link == camp.invite_link
-        ))
-        if not old_known:
-            sdb.add(CampaignInviteLink(
-                campaign_id=camp.id,
-                invite_link=camp.invite_link,
-                is_current=False,
-                created_at=camp.created_at,
-                replaced_at=now(),
-            ))
-
-        sdb.add(CampaignInviteLink(
-            campaign_id=camp.id,
-            invite_link=fresh.invite_link,
-            is_current=True,
-            created_at=now(),
-            last_checked_at=now(),
-        ))
-        camp.invite_link = fresh.invite_link
-        camp.updated_at = now()
+        # Une même erreur est rappelée au plus une fois par 24 heures.
+        recent = await sdb.scalar(select(HealthAlert.id).where(
+            HealthAlert.fingerprint == fingerprint,
+            HealthAlert.resolved.is_(False),
+            HealthAlert.created_at > current - timedelta(hours=24),
+        ).limit(1))
+        for alert in alerts:
+            if reason is None or alert.fingerprint != fingerprint or not recent:
+                alert.resolved = True
+                alert.resolved_at = current
+        if reason is not None and not recent:
+            sdb.add(HealthAlert(group_id=campaign.pub_group_id,
+                              fingerprint=fingerprint, created_at=current))
+            alert_needed = True
         await sdb.commit()
-
-    notified = False
-    if notify_user:
-        try:
-            await bot.send_message(
-                user_id,
-                notification_title + '\n\n'
-                'Utilise désormais ce lien pour tes nouveaux partages. '
-                'Ton compteur et tes minutes restent inchangés.\n\n'
-                f'<code>{fresh.invite_link}</code>',
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
-            notified = True
-        except TelegramError:
-            pass
-    return fresh.invite_link, notified, 'nouveau lien permanent créé'
+    if alert_needed:
+        title = group.title if group else 'Groupe absent de la base'
+        await notify_admins(
+            bot,
+            '⚠️ <b>Vérification du lien de parrainage en échec</b>\n\n'
+            f'Groupe : {escape(title)}\n'
+            f'ID groupe : <code>{campaign.pub_group_id}</code>\n'
+            f'Utilisateur : <code>{campaign.user_id}</code>\n'
+            f'Campagne : <code>{campaign.id}</code>\n'
+            f'Lien : <code>{escape(campaign.invite_link)}</code>\n'
+            f'Erreur : <code>{escape(reason)}</code>\n\n'
+            'Le lien est conservé. Aucun nouveau lien créé, aucun message utilisateur.\n'
+            'Un échec de vérification ne prouve pas que le lien est inutilisable.',
+        )
 
 
-async def ensure_campaign_invite_link(
-    bot,
-    campaign: Campaign,
-    *,
-    notify_user: bool = False,
-    refresh_if_old: bool = False,
-) -> tuple[str | None, bool, str]:
-    """Retourne un lien de campagne sûr et renouvelle si nécessaire.
+async def audit_campaign_link(bot, campaign: Campaign) -> tuple[bool, bool]:
+    """Vérifie le même lien et enlève ses limites sans jamais le remplacer.
 
-    ``refresh_if_old`` est utilisé par « MON LIEN » : si le lien courant a plus
-    de ``CAMPAIGN_LINK_REFRESH_MINUTES``, on crée directement un nouveau lien à
-    partir de Telegram au lieu de faire confiance à une ancienne URL stockée.
+    Telegram n'offre pas de test de clic via la Bot API. L'édition du lien
+    existant sert à contrôler son accessibilité et ses paramètres. Elle ne
+    garantit pas qu'un utilisateur particulier pourra rejoindre le groupe.
     """
+    global _campaign_audit_retry_at
     async with SessionLocal() as sdb:
         camp = await sdb.get(Campaign, campaign.id)
         if not camp or camp.status != CampaignStatus.active:
-            return None, False, 'campagne inactive'
+            return True, False
         group = await sdb.get(Group, camp.pub_group_id)
-        if not group or group.role != GroupRole.pub or not group.authorized:
-            return None, False, 'groupe PUB indisponible'
-        old_link = camp.invite_link
-        user_id = camp.user_id
-        pub_group_id = camp.pub_group_id
-        row = await sdb.scalar(
-            select(CampaignInviteLink)
-            .where(CampaignInviteLink.campaign_id == camp.id, CampaignInviteLink.is_current.is_(True))
-            .order_by(CampaignInviteLink.id.desc())
-        )
-        if not row:
-            row = CampaignInviteLink(
-                campaign_id=camp.id, invite_link=old_link, is_current=True,
-                created_at=camp.created_at,
+    reason = None
+    retry_later = False
+    if not group or group.role != GroupRole.pub:
+        reason = 'Configuration : groupe PUB absent ou non configuré'
+    else:
+        try:
+            checked = await bot.edit_chat_invite_link(
+                chat_id=camp.pub_group_id,
+                invite_link=camp.invite_link,
+                name=f'parrain-{camp.user_id}'[:32],
+                expire_date=0,
+                member_limit=0,
+                creates_join_request=False,
             )
-            sdb.add(row)
-            await sdb.commit()
+            if checked.is_revoked:
+                reason = 'Telegram : is_revoked=True (lien révoqué)'
+            elif checked.invite_link != camp.invite_link:
+                reason = 'Telegram : URL retournée différente du lien conservé'
+            elif checked.expire_date or checked.member_limit or checked.creates_join_request:
+                reason = ('Telegram : paramètres illimités non confirmés : '
+                          f'expire_date={checked.expire_date}, '
+                          f'member_limit={checked.member_limit}, '
+                          f'creates_join_request={checked.creates_join_request}')
+        except RetryAfter as exc:
+            reason = f'{type(exc).__name__}: {exc}'
+            delay = exc.retry_after
+            if not isinstance(delay, timedelta):
+                delay = timedelta(seconds=float(delay))
+            _campaign_audit_retry_at = now() + delay + timedelta(seconds=1)
+            retry_later = True
+        except TelegramError as exc:
+            reason = f'{type(exc).__name__}: {exc}'
+    await report_campaign_link_check(bot, camp, group, reason)
+    return reason is None, retry_later
 
-    ok, rights_reason = await bot_rights(bot, pub_group_id)
-    if not ok:
-        return None, False, rights_reason
 
-    if refresh_if_old:
-        age = now() - row.created_at
-        if age >= timedelta(minutes=max(0, settings.campaign_link_refresh_minutes)):
-            link, _, reason = await rotate_campaign_invite_link(
-                bot, campaign.id, notify_user=notify_user,
-                notification_title='🔧 <b>Ton lien personnel a été sécurisé.</b>',
-            )
-            return link, bool(link), reason
-
-    # L'API ne propose pas de « test de clic ». On utilise l'édition comme audit
-    # du lien créé par le bot ; si Telegram le refuse, on le remplace.
-    try:
-        checked = await bot.edit_chat_invite_link(
-            chat_id=pub_group_id,
-            invite_link=old_link,
-            name=f'parrain-{user_id}'[:32],
-            expire_date=None,
-            member_limit=None,
-            creates_join_request=False,
-        )
+async def audit_campaign_links(bot, *, limit: int | None = None, after_id: int = 0) -> dict[str, int]:
+    """Audit silencieux : seules les anomalies produisent une alerte admin."""
+    async with _campaign_audit_lock:
+        stats = {'scanned': 0, 'healthy': 0, 'errors': 0, 'last_id': after_id, 'throttled': 0}
+        if _campaign_audit_retry_at and now() < _campaign_audit_retry_at:
+            stats['throttled'] = 1
+            return stats
         async with SessionLocal() as sdb:
-            link_row = await sdb.scalar(select(CampaignInviteLink).where(
-                CampaignInviteLink.invite_link == old_link
-            ))
-            if link_row:
-                link_row.last_checked_at = now()
-                link_row.last_error = None
-                link_row.revoked = bool(checked.is_revoked)
-                await sdb.commit()
-        if not checked.is_revoked:
-            return checked.invite_link, False, 'OK'
-    except RetryAfter as exc:
-        await asyncio.sleep(float(exc.retry_after) + 0.5)
-        return None, False, 'limite Telegram, nouvel essai nécessaire'
-    except TelegramError as exc:
-        async with SessionLocal() as sdb:
-            link_row = await sdb.scalar(select(CampaignInviteLink).where(
-                CampaignInviteLink.invite_link == old_link
-            ))
-            if link_row:
-                link_row.last_checked_at = now()
-                link_row.last_error = str(exc)
-                await sdb.commit()
-
-    link, _, reason = await rotate_campaign_invite_link(
-        bot, campaign.id, notify_user=notify_user,
-        notification_title='🔧 <b>Ton ancien lien a été réparé.</b>',
-    )
-    return link, bool(link), reason
+            stmt = select(Campaign).where(
+                Campaign.status == CampaignStatus.active, Campaign.id > after_id,
+            ).order_by(Campaign.id.asc())
+            if limit:
+                stmt = stmt.limit(limit)
+            campaigns = list((await sdb.scalars(stmt)).all())
+        for camp in campaigns:
+            ok, retry_later = await audit_campaign_link(bot, camp)
+            stats['scanned'] += 1
+            stats['healthy' if ok else 'errors'] += 1
+            if retry_later:
+                # Arrêter le lot, sans remplacer le lien ni attendre dans le job.
+                stats['throttled'] = 1
+                break
+            stats['last_id'] = camp.id
+            await asyncio.sleep(0.03)
+        return stats
 
 
-async def repair_campaign_links(bot, *, notify_users: bool, limit: int | None = None, after_id: int = 0) -> dict[str, int]:
-    """Audit et réparation des liens de campagnes actives.
-
-    ``limit`` permet au contrôle automatique de travailler par petits lots. Le
-    bouton administrateur utilise ``None`` pour auditer toutes les campagnes.
-    """
-    stats = {
-        'scanned': 0, 'affected': 0, 'repaired': 0, 'notified': 0,
-        'healthy': 0, 'group_errors': 0, 'errors': 0, 'last_id': after_id,
-    }
-    async with SessionLocal() as sdb:
-        stmt = select(Campaign).where(
-            Campaign.status == CampaignStatus.active,
-            Campaign.id > after_id,
-        ).order_by(Campaign.id.asc())
-        if limit:
-            stmt = stmt.limit(limit)
-        campaigns = list((await sdb.scalars(stmt)).all())
-
-    for camp in campaigns:
-        stats['scanned'] += 1
-        stats['last_id'] = max(stats['last_id'], camp.id)
-        old_link = camp.invite_link
-        link, repaired, reason = await ensure_campaign_invite_link(bot, camp, notify_user=False)
-        if repaired:
-            stats['affected'] += 1
-            stats['repaired'] += 1
-            if notify_users and link:
-                try:
-                    await bot.send_message(
-                        camp.user_id,
-                        '🔧 <b>Ton lien personnel a été réparé.</b>\n\n'
-                        'Ton ancien lien n’était plus utilisable. Aucun compteur ni aucune minute n’a été perdu.\n\n'
-                        f'Voici ton nouveau lien :\n<code>{link}</code>',
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                    stats['notified'] += 1
-                except TelegramError:
-                    pass
-        elif link:
-            stats['healthy'] += 1
-        elif 'groupe' in reason.casefold() or 'administrateur' in reason.casefold() or 'droit' in reason.casefold():
-            stats['group_errors'] += 1
-        else:
-            stats['errors'] += 1
-        # Petit délai pour éviter une rafale d'appels API lors d'une réparation globale.
-        await asyncio.sleep(0.03)
-    return stats
-
-
-async def run_manual_link_repair(bot, admin_id: int) -> None:
-    stats = await repair_campaign_links(bot, notify_users=True)
-    try:
-        await bot.send_message(
-            admin_id,
-            '🛠 <b>Réparation globale terminée</b>\n\n'
-            f'Campagnes contrôlées : <b>{stats["scanned"]}</b>\n'
-            f'Personnes concernées : <b>{stats["affected"]}</b>\n'
-            f'Liens réparés : <b>{stats["repaired"]}</b>\n'
-            f'Utilisateurs prévenus : <b>{stats["notified"]}</b>\n'
-            f'Liens déjà sains : <b>{stats["healthy"]}</b>\n'
-            f'Groupes à vérifier : <b>{stats["group_errors"]}</b>\n'
-            f'Autres erreurs : <b>{stats["errors"]}</b>',
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_menu(),
-        )
-    except TelegramError:
-        pass
-
-
-async def rotate_all_campaign_links(bot, admin_id: int) -> None:
-    """Rotation forcée de tous les liens courants avec rapport administrateur."""
-    stats = {'total': 0, 'rotated': 0, 'notified': 0, 'group_errors': 0, 'errors': 0}
-    async with SessionLocal() as sdb:
-        campaigns = list((await sdb.scalars(
-            select(Campaign).where(Campaign.status == CampaignStatus.active).order_by(Campaign.id.asc())
-        )).all())
-    stats['total'] = len(campaigns)
-
-    for camp in campaigns:
-        link, notified, reason = await rotate_campaign_invite_link(
-            bot,
-            camp.id,
-            notify_user=True,
-            notification_title='♻️ <b>Ton lien personnel a été renouvelé.</b>',
-        )
-        if link:
-            stats['rotated'] += 1
-            stats['notified'] += int(notified)
-        elif 'groupe' in reason.casefold() or 'administrateur' in reason.casefold() or 'droit' in reason.casefold():
-            stats['group_errors'] += 1
-        else:
-            stats['errors'] += 1
-        await asyncio.sleep(0.05)
-
-    try:
-        await bot.send_message(
-            admin_id,
-            '♻️ <b>Renouvellement global terminé</b>\n\n'
-            f'Campagnes actives : <b>{stats["total"]}</b>\n'
-            f'Nouveaux liens créés : <b>{stats["rotated"]}</b>\n'
-            f'Utilisateurs prévenus : <b>{stats["notified"]}</b>\n'
-            f'Groupes à vérifier : <b>{stats["group_errors"]}</b>\n'
-            f'Autres erreurs : <b>{stats["errors"]}</b>\n\n'
-            'Les anciens liens ne sont pas révoqués automatiquement : s’ils sont encore '
-            'fonctionnels et déjà partagés, ils continuent à créditer la même campagne.',
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_menu(),
-        )
-    except TelegramError:
-        pass
-
-
-async def rotate_stale_campaign_links(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Rotation préventive des liens trop anciens, par petits lots.
-
-    C'est la protection long terme : un lien courant n'est jamais conservé au-delà
-    de CAMPAIGN_LINK_MAX_AGE_HOURS sans qu'un nouveau lien Telegram soit créé.
-    """
-    cutoff = now() - timedelta(hours=max(1, settings.campaign_link_max_age_hours))
-    batch = max(1, settings.campaign_link_rotation_batch)
-    async with SessionLocal() as sdb:
-        rows = list((await sdb.scalars(
-            select(CampaignInviteLink)
-            .join(Campaign, Campaign.id == CampaignInviteLink.campaign_id)
-            .where(
-                Campaign.status == CampaignStatus.active,
-                CampaignInviteLink.is_current.is_(True),
-                CampaignInviteLink.created_at <= cutoff,
-            )
-            .order_by(CampaignInviteLink.created_at.asc())
-            .limit(batch)
-        )).all())
-
-    stats = {'scanned': len(rows), 'rotated': 0, 'notified': 0, 'errors': 0}
-    for row in rows:
-        link, notified, _ = await rotate_campaign_invite_link(
-            context.bot,
-            row.campaign_id,
-            notify_user=True,
-            notification_title='🔄 <b>Ton lien personnel a été renouvelé automatiquement.</b>',
-        )
-        if link:
-            stats['rotated'] += 1
-            stats['notified'] += int(notified)
-        else:
-            stats['errors'] += 1
-        await asyncio.sleep(0.05)
-
-    context.application.bot_data['last_campaign_link_rotation'] = stats
-    if stats['rotated'] or stats['errors']:
-        await notify_admins(
-            context.bot,
-            '♻️ <b>Rotation préventive des liens</b>\n\n'
-            f'Liens arrivés à échéance interne : {stats["scanned"]}\n'
-            f'Nouveaux liens : {stats["rotated"]}\n'
-            f'Utilisateurs prévenus : {stats["notified"]}\n'
-            f'Erreurs : {stats["errors"]}',
-        )
+async def run_manual_link_audit(bot) -> None:
+    await audit_campaign_links(bot)
 
 
 async def campaign_link_watch(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Contrôle permanent par lots pour éviter de renvoyer des liens morts à l'avenir."""
     cursor = int(context.application.bot_data.get('campaign_link_cursor', 0) or 0)
     batch = max(1, settings.campaign_link_audit_batch)
-    stats = await repair_campaign_links(
-        context.bot,
-        notify_users=True,
-        limit=batch,
-        after_id=cursor,
+    stats = await audit_campaign_links(context.bot, limit=batch, after_id=cursor)
+    context.application.bot_data['campaign_link_cursor'] = (
+        stats['last_id'] if stats['throttled'] or stats['scanned'] >= batch else 0
     )
-    # Fin de la liste : on repart du début au prochain passage.
-    if stats['scanned'] < batch:
-        context.application.bot_data['campaign_link_cursor'] = 0
-    else:
-        context.application.bot_data['campaign_link_cursor'] = stats['last_id']
     context.application.bot_data['last_campaign_link_audit'] = stats
-    if stats['repaired'] or stats['group_errors'] or stats['errors']:
-        await notify_admins(
-            context.bot,
-            '🔗 <b>Contrôle automatique des liens</b>\n\n'
-            f'Contrôlés : {stats["scanned"]}\n'
-            f'Liens réparés : {stats["repaired"]}\n'
-            f'Utilisateurs prévenus : {stats["notified"]}\n'
-            f'Groupes à vérifier : {stats["group_errors"]}\n'
-            f'Erreurs : {stats["errors"]}',
-        )
 
 
-async def startup_campaign_link_repair(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Répare le passé à chaque déploiement, sans attendre un clic utilisateur."""
-    stats = await repair_campaign_links(context.bot, notify_users=True)
-    context.application.bot_data['last_campaign_link_audit'] = stats
-    if stats['affected'] or stats['group_errors'] or stats['errors']:
-        await notify_admins(
-            context.bot,
-            '🧰 <b>Réparation des liens au démarrage</b>\n\n'
-            f'Campagnes contrôlées : {stats["scanned"]}\n'
-            f'Personnes concernées : {stats["affected"]}\n'
-            f'Liens réparés : {stats["repaired"]}\n'
-            f'Utilisateurs prévenus : {stats["notified"]}\n'
-            f'Groupes à vérifier : {stats["group_errors"]}\n'
-            f'Erreurs : {stats["errors"]}',
-        )
+async def startup_campaign_link_audit(context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Premier lot au démarrage ; les suivants sont traités par le contrôle périodique.
+    await campaign_link_watch(context)
 
 
 async def release_lost_pub_group(bot, group_id: int, reason: str) -> dict[str, int]:
@@ -524,6 +279,9 @@ async def release_lost_pub_group(bot, group_id: int, reason: str) -> dict[str, i
         revoke_vip_links: list[tuple[int, str]] = []
 
         for camp in campaigns:
+            enrollment = await challenges.enrollment_for(sdb, camp.id)
+            if enrollment and enrollment.status != 'approved':
+                enrollment.status = 'cancelled'
             camp.status = CampaignStatus.closed
             camp.pending_invites = 0
             stats['campaigns'] += 1
@@ -622,6 +380,9 @@ async def reconcile_lost_groups(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _send_trial_link(message, bot, camp: Campaign, user_id: int) -> bool:
     """Crée ou renvoie l'accès découverte. Retourne True si un lien a été envoyé."""
+    if await challenges.has_lifetime(user_id, camp.vip_group_id):
+        await show_counter(message, user_id)
+        return True
     async with SessionLocal() as sdb:
         latest = await sdb.scalar(
             select(TrialAccess)
@@ -638,17 +399,16 @@ async def _send_trial_link(message, bot, camp: Campaign, user_id: int) -> bool:
                     '🎁 <b>Ton accès est prêt.</b>\n\nProfite du VIP 👇',
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(
-                        [[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=latest.invite_link)]]
+                        [[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=latest.invite_link)],
+                         [InlineKeyboardButton('📊 MON ESPACE', callback_data='u:counter')]]
                     ),
                 )
                 return True
 
         # Un essai déjà commencé/terminé n'est jamais recréé.
-        if latest and latest.status in (
-            TrialStatus.active,
-            TrialStatus.kick_pending,
-            TrialStatus.kicked,
-        ):
+        if latest and (latest.started_at is not None or latest.status in (
+            TrialStatus.active, TrialStatus.kick_pending, TrialStatus.kicked,
+        )):
             return False
 
     ok, reason = await bot_rights(bot, camp.vip_group_id, require_delete=True)
@@ -693,7 +453,8 @@ async def _send_trial_link(message, bot, camp: Campaign, user_id: int) -> bool:
         '🎁 <b>Ton accès est prêt.</b>\n\nProfite du VIP 👇',
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=link.invite_link)]]
+            [[InlineKeyboardButton('🚀 ENTRER DANS LE VIP', url=link.invite_link)],
+             [InlineKeyboardButton('📊 MON ESPACE', callback_data='u:counter')]]
         ),
     )
     return True
@@ -703,6 +464,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or update.effective_chat.type != ChatType.PRIVATE:
         return
 
+    context.user_data.pop('challenge_proof', None)
+    context.user_data.pop('challenge_reject', None)
     user = await ensure_user(update.effective_user)
     if await is_admin(user.telegram_id) and not context.args:
         await update.message.reply_text(
@@ -717,6 +480,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     camp = await active_campaign(user.telegram_id)
+    if not context.args and await challenges.all_lifetime(user.telegram_id):
+        await show_counter(update.effective_message, user.telegram_id)
+        return
 
     # Arrivée depuis le bouton « VIP GRATUIT » d'un groupe PUB.
     if context.args and context.args[0].startswith('pub_'):
@@ -761,10 +527,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
             try:
-                ref = await context.bot.create_chat_invite_link(
-                    group.chat_id,
-                    name=f'parrain-{user.telegram_id}'[:32],
-                )
+                ref = await create_permanent_campaign_link(context.bot, group.chat_id, user.telegram_id)
             except TelegramError as exc:
                 await update.message.reply_text('Impossible de préparer ton accès pour le moment.')
                 await notify_admins(
@@ -820,43 +583,47 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def show_counter(message, user_id: int) -> None:
     camp = await active_campaign(user_id)
+    grants = await challenges.all_lifetime(user_id)
+    async with SessionLocal() as db:
+        total = await total_valid_invites(db, user_id)
     if not camp:
-        await message.reply_text('Aucune campagne active.')
+        if grants:
+            await challenges.show_lifetime_accesses(message, user_id)
+        else:
+            await message.reply_text(
+                '📊 <b>Ton espace</b>\n\n' + rank_summary(total) +
+                '\n\nOuvre « VIP GRATUIT » depuis un groupe partenaire pour obtenir ton lien.',
+                parse_mode=ParseMode.HTML, reply_markup=challenges.keyboard([
+                    [('🏅 MES RANGS', 'u:ranks')], [('🏆 DÉFI VIP À VIE · FACULTATIF', 'u:challenge')]]))
         return
     rem = await remaining_minutes(camp)
     session = await active_session(user_id)
-    status = 'Aucun accès actif'
-    blocked_label = None
-    if session and session.status == VipSessionStatus.active and session.expires_at:
-        seconds = max(0, int((session.expires_at - now()).total_seconds()))
+    permanent = any(grant.vip_group_id == camp.vip_group_id for grant in grants)
+    status, blocked_label = 'Aucun accès actif', None
+    if permanent:
+        status = '👑 Accès VIP à vie approuvé'
+    elif session and session.status == VipSessionStatus.active and session.expires_at:
+        seconds = max(0, int((challenges.aware(session.expires_at) - now()).total_seconds()))
         status = f'VIP actif — environ {seconds // 60} min restantes'
         blocked_label = '⏱ ACCÈS VIP EN COURS'
     elif session and session.status == VipSessionStatus.link_created:
-        status = 'Lien VIP déjà généré'
-        blocked_label = '🔐 LIEN VIP DÉJÀ GÉNÉRÉ'
+        status, blocked_label = 'Lien VIP déjà généré', '🔐 LIEN VIP DÉJÀ GÉNÉRÉ'
     elif session and session.status == VipSessionStatus.kick_pending:
-        status = 'Sortie VIP en cours de vérification'
-        blocked_label = '⏳ VÉRIFICATION EN COURS'
+        status, blocked_label = 'Sortie VIP en cours de vérification', '⏳ VÉRIFICATION EN COURS'
     missing = max(0, settings.minimum_minutes - rem)
-    text = (
-        '📊 <b>Ton compteur</b>\n\n'
-        f'✅ Invitations validées : <b>{camp.valid_invites}</b>\n'
-        f'⏳ En vérification : <b>{camp.pending_invites}</b>\n'
-        f'❌ Non validées : <b>{camp.invalid_invites}</b>\n\n'
-        f'⏱ Crédit disponible : <b>{rem} minute(s)</b>\n'
-        f'🔐 Statut : {status}'
-    )
-    if rem < settings.minimum_minutes:
-        text += f'\n\nIl te manque <b>{missing}</b> invitation(s) valide(s) pour générer un accès.'
-    await message.reply_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=user_menu(
-            rem >= settings.minimum_minutes and not session,
-            missing,
-            blocked_label=blocked_label,
-        ),
-    )
+    text = ('📊 <b>Ton compteur</b>\n\n' + rank_summary(total) + '\n\n'
+            f'✅ Invitations validées dans ce groupe : <b>{camp.valid_invites}</b>\n'
+            f'⏳ En vérification : <b>{camp.pending_invites}</b>\n'
+            f'❌ Non validées : <b>{camp.invalid_invites}</b>\n\n'
+            f'⏱ Crédit disponible : <b>{rem} minute(s)</b>\n'
+            f'🔐 Statut : {status}')
+    if missing and not permanent:
+        text += f'\n\nIl te manque <b>{missing} minute(s)</b> pour générer un accès.'
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=user_menu(
+        rem >= settings.minimum_minutes and not session and not permanent,
+        0 if permanent else missing, blocked_label=blocked_label,
+        lifetime=bool(grants), permanent=permanent,
+    ))
 
 
 async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -864,6 +631,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     data = q.data or ''
     uid = q.from_user.id
+    if data != 'u:challenge:proof':
+        context.user_data.pop('challenge_proof', None)
+    if not data.startswith('a:ch:reject:'):
+        context.user_data.pop('challenge_reject', None)
 
     if data.startswith('a:'):
         if not await is_admin(uid):
@@ -872,16 +643,24 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await admin_callback(q, context, data)
         return
 
-    if data == 'u:rules':
+    async with SessionLocal() as db:
+        account = await db.get(User, uid)
+        if account and account.banned:
+            await q.message.reply_text('⛔ Ton compte est bloqué. Contacte un administrateur.')
+            return
+    if await challenges.handle_user_callback(q, context, data):
+        return
+    if data in ('u:rules', 'u:ranks'):
+        async with SessionLocal() as db:
+            total = await total_valid_invites(db, uid)
         await q.message.reply_text(
-            '📖 <b>Comment ça marche ?</b>\n\n'
-            '1️⃣ Le bot crée un lien vers le groupe PUB depuis lequel tu as commencé.\n'
-            '2️⃣ Chaque personne validée ajoute une minute à ton crédit.\n'
-            f'3️⃣ À partir de {settings.minimum_minutes} minutes, tu peux générer un lien VIP personnel.\n'
-            '4️⃣ Le temps commence seulement lorsque tu rejoins réellement le VIP.\n'
-            '5️⃣ Les nouvelles invitations validées pendant ton accès prolongent immédiatement sa durée.\n'
-            '6️⃣ À zéro minute, tu es automatiquement retiré du VIP.\n\n'
-            'Une seule campagne peut être active à la fois.', parse_mode=ParseMode.HTML)
+            '🏅 <b>Les rangs VIP</b>\n\n' + rank_summary(total) + '\n\n' + rank_rules() +
+            '\n\nLe rang dépend de toutes tes invitations validées, même dans tes anciennes campagnes. '
+            'Il ne baisse pas quand tu dépenses tes minutes. Le nouveau tarif s’applique aux invitations suivantes, sans recalcul du passé.\n\n'
+            f'🔐 À partir de {settings.minimum_minutes} minutes, tu peux demander un accès. Le temps commence à ton entrée réelle. '
+            'Les nouvelles invitations prolongent une session en cours selon ton rang.\n\n'
+            '🏆 Le défi VIP à vie est séparé et facultatif. Omega ne donne pas l’accès à vie.',
+            parse_mode=ParseMode.HTML, reply_markup=challenges.keyboard([challenges.home_row()]))
         return
 
     if data == 'u:create':
@@ -900,7 +679,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not ok:
             await q.message.reply_text(f'Le groupe PUB n’est pas opérationnel : {reason}.'); return
         try:
-            link = await context.bot.create_chat_invite_link(group_id, name=f'parrain-{uid}'[:32])
+            link = await create_permanent_campaign_link(context.bot, group_id, uid)
         except TelegramError as exc:
             await q.message.reply_text(f'Création du lien impossible : {exc}'); return
         async with SessionLocal() as s:
@@ -913,19 +692,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ))
             s.add(MetricEvent(event_type=EventType.campaign_started, pub_group_id=group_id, ad_version=group.ad_version, user_id=uid))
             await s.commit()
-        await q.message.reply_text(f'✅ <b>Ton lien personnel est prêt !</b>\n\n<code>{link.invite_link}</code>\n\nChaque invitation validée ajoute une minute.', parse_mode=ParseMode.HTML, reply_markup=user_menu(False, settings.minimum_minutes))
+        await q.message.reply_text(f'✅ <b>Ton lien personnel est prêt !</b>\n\n<code>{link.invite_link}</code>\n\nChaque invitation validée rapporte des minutes selon ton rang.', parse_mode=ParseMode.HTML, reply_markup=user_menu(False, settings.minimum_minutes))
         return
 
     if data in ('u:counter', 'u:link'):
         if data == 'u:link':
             camp = await active_campaign(uid)
             if camp:
-                link, repaired, reason = await ensure_campaign_invite_link(context.bot, camp, refresh_if_old=True)
-                if link:
-                    prefix = '🔧 <b>Ton ancien lien a été réparé automatiquement.</b>\n\n' if repaired else '🔗 <b>Ton lien personnel</b>\n\n'
-                    await q.message.reply_text(prefix + f'<code>{link}</code>', parse_mode=ParseMode.HTML)
-                else:
-                    await q.message.reply_text(f'⚠️ Ton lien ne peut pas être vérifié pour le moment : {reason}.')
+                await q.message.reply_text(
+                    '🔗 <b>Ton lien personnel permanent</b>\n\n'
+                    f'<code>{escape(camp.invite_link)}</code>',
+                    parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+                )
             else:
                 await q.message.reply_text('Aucune campagne active.')
         else:
@@ -934,6 +712,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == 'u:use':
         camp = await active_campaign(uid)
+        if camp and await challenges.has_lifetime(uid, camp.vip_group_id):
+            await challenges.show_lifetime_accesses(q.message, uid)
+            return
         if not camp:
             await q.message.reply_text('Aucune campagne active.'); return
         rem = await remaining_minutes(camp)
@@ -946,6 +727,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if data == 'u:confirmvip':
         camp = await active_campaign(uid)
+        if camp and await challenges.has_lifetime(uid, camp.vip_group_id):
+            await challenges.show_lifetime_accesses(q.message, uid)
+            return
         if not camp or await active_session(uid):
             await q.message.reply_text('Accès déjà actif ou campagne absente.'); return
         rem = await remaining_minutes(camp)
@@ -971,6 +755,11 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def admin_callback(q, context, data: str) -> None:
+    if await challenges.handle_admin_callback(q, context, data):
+        return
+    if data == 'a:notices':
+        await announcements.show_notice_status(q.message)
+        return
     if data in ('a:menu',):
         await q.message.reply_text('🛠 Panneau administrateur', reply_markup=admin_menu()); return
     if data == 'a:groups':
@@ -1186,37 +975,18 @@ async def admin_callback(q, context, data: str) -> None:
         return
     if data == 'a:repairlinks':
         await q.message.reply_text(
-            '🛠 <b>Audit global lancé.</b>\n\nLe bot vérifie toutes les campagnes actives, recrée les liens morts et envoie automatiquement le nouveau lien aux utilisateurs concernés.\n\nUn rapport complet sera envoyé ici à la fin.',
-            parse_mode=ParseMode.HTML,
+            '🔎 Audit lancé. Seules les anomalies seront signalées aux administrateurs. '
+            'Les liens seront conservés et aucun message ne sera envoyé aux utilisateurs.'
         )
         context.application.create_task(
-            run_manual_link_repair(context.bot, q.from_user.id),
-            name=f'repair-links-{q.from_user.id}',
+            run_manual_link_audit(context.bot), name=f'audit-links-{q.from_user.id}',
         )
         return
-    if data == 'a:rotateall':
-        async with SessionLocal() as sdb:
-            count = int(await sdb.scalar(select(func.count(Campaign.id)).where(
-                Campaign.status == CampaignStatus.active
-            )) or 0)
+    if data in ('a:rotateall', 'a:rotateall:confirm'):
+        # Les boutons présents dans d'anciens messages restent inoffensifs.
         await q.message.reply_text(
-            '♻️ <b>Renouveler tous les liens personnels ?</b>\n\n'
-            f'Campagnes actives concernées : <b>{count}</b>\n\n'
-            'Un nouveau lien permanent sera créé pour chaque campagne et envoyé à chaque utilisateur. '
-            'Les compteurs et les minutes resteront inchangés. Les anciens liens déjà partagés resteront '
-            'rattachés à la campagne afin de continuer à compter s’ils fonctionnent encore.',
-            parse_mode=ParseMode.HTML,
-            reply_markup=rotate_all_confirm(count),
-        )
-        return
-    if data == 'a:rotateall:confirm':
-        await q.message.reply_text(
-            '♻️ Renouvellement lancé en arrière-plan. Tu recevras le bilan complet à la fin.',
+            'Le renouvellement est désactivé : les liens de parrainage sont permanents.',
             reply_markup=admin_menu(),
-        )
-        context.application.create_task(
-            rotate_all_campaign_links(context.bot, q.from_user.id),
-            name=f'rotate-all-links-{q.from_user.id}',
         )
         return
     if data == 'a:words':
@@ -1228,6 +998,8 @@ async def admin_callback(q, context, data: str) -> None:
 
 
 async def admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user and await challenges.handle_input(update, context):
+        return
     if not update.effective_user or not await is_admin(update.effective_user.id):
         return
     action = context.user_data.get('admin_input')
@@ -1341,6 +1113,8 @@ async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = cmu.new_chat_member.user
 
     if group.role == GroupRole.pub and cmu.invite_link:
+        if getattr(user, 'is_bot', False):
+            return
         async with SessionLocal() as sdb:
             link_row = await sdb.scalar(select(CampaignInviteLink).where(
                 CampaignInviteLink.invite_link == cmu.invite_link.invite_link,
@@ -1377,7 +1151,7 @@ async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                         pass
                 await sdb.commit()
                 return
-            sdb.add(Invite(campaign_id=camp.id, joined_user_id=user.id, joined_username=user.username, joined_name=user.full_name, validate_after=now() + timedelta(minutes=settings.validation_minutes)))
+            sdb.add(Invite(campaign_id=camp.id, joined_user_id=user.id, joined_username=user.username, joined_name=user.full_name, joined_at=getattr(cmu, 'date', None) or now(), validate_after=now() + timedelta(minutes=settings.validation_minutes)))
             camp.pending_invites += 1
             await sdb.commit()
         return
@@ -1385,6 +1159,8 @@ async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if group.role != GroupRole.vip:
         return
 
+    if await challenges.has_lifetime(user.id, chat_id):
+        return
     used_link = cmu.invite_link.invite_link if cmu.invite_link else None
     async with SessionLocal() as sdb:
         trial = None
@@ -1415,13 +1191,16 @@ async def member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 await sdb.commit()
                 return
 
-    # Toute entrée ne correspondant pas à un lien actif est retirée immédiatement.
-    try:
-        await context.bot.ban_chat_member(group.chat_id, user.id)
-        await context.bot.unban_chat_member(group.chat_id, user.id, only_if_banned=True)
-        await record(EventType.unauthorized_join, user_id=user.id)
-    except TelegramError as exc:
-        await notify_admins(context.bot, f'🚨 <b>Entrée VIP non autorisée</b>\nUtilisateur : <code>{user.id}</code>\nExpulsion impossible : {exc}')
+    # Même verrou que la décision admin : ne jamais expulser un droit approuvé.
+    async with challenges.access_lock(user.id):
+        if await challenges.has_lifetime(user.id, chat_id):
+            return
+        try:
+            await context.bot.ban_chat_member(group.chat_id, user.id)
+            await context.bot.unban_chat_member(group.chat_id, user.id, only_if_banned=True)
+            await record(EventType.unauthorized_join, user_id=user.id)
+        except TelegramError as exc:
+            await notify_admins(context.bot, f'🚨 <b>Entrée VIP non autorisée</b>\nUtilisateur : <code>{user.id}</code>\nExpulsion impossible : {escape(str(exc))}')
 
 
 async def delete_vip_service_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1441,53 +1220,89 @@ async def delete_vip_service_message(update: Update, context: ContextTypes.DEFAU
 
 
 async def validate_invites(context: ContextTypes.DEFAULT_TYPE) -> None:
-    async with SessionLocal() as s:
-        invites = list((await s.scalars(select(Invite).where(Invite.status == InviteStatus.pending, Invite.validate_after <= now()).limit(200))).all())
+    notifications = []
+    async with SessionLocal() as db:
+        invites = list((await db.scalars(select(Invite).where(
+            Invite.status == InviteStatus.pending, Invite.validate_after <= now(),
+        ).order_by(Invite.validate_after, Invite.id).limit(200).with_for_update(skip_locked=True))).all())
         for inv in invites:
-            camp = await s.get(Campaign, inv.campaign_id)
+            camp = await db.get(Campaign, inv.campaign_id)
+            owner = await db.scalar(select(User).where(User.telegram_id == camp.user_id).with_for_update())
+            if not owner or owner.banned or camp.status != CampaignStatus.active:
+                inv.status, inv.reason = InviteStatus.invalid, 'campagne inactive ou compte bloqué'
+                camp.pending_invites = max(0, camp.pending_invites - 1)
+                camp.invalid_invites += 1
+                continue
             try:
                 member = await context.bot.get_chat_member(camp.pub_group_id, inv.joined_user_id)
-                valid = member.status not in (ChatMember.LEFT, ChatMember.BANNED)
+                valid = (member.status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR, ChatMember.OWNER) or
+                         member.status == ChatMember.RESTRICTED and getattr(member, 'is_member', False))
             except TelegramError:
-                valid = False
+                # Une panne de contrôle ne doit pas invalider une vraie invitation.
+                continue
             camp.pending_invites = max(0, camp.pending_invites - 1)
             inv.validated_at = now()
             if valid:
-                inv.status = InviteStatus.valid; camp.valid_invites += 1; camp.minutes_earned += 1
-                s.add(MetricEvent(event_type=EventType.invite_valid, pub_group_id=camp.pub_group_id, user_id=camp.user_id))
-                active = await s.scalar(select(VipSession).where(VipSession.campaign_id == camp.id, VipSession.status == VipSessionStatus.active))
-                if active and active.expires_at:
-                    # La minute est utilisée immédiatement puisqu'elle prolonge une
-                    # session déjà en cours. Elle ne doit pas rester une seconde fois
-                    # dans le crédit disponible après l'expulsion.
-                    active.expires_at += timedelta(minutes=1)
-                    active.allocated_minutes += 1
-                    camp.minutes_consumed += 1
-                    try: await context.bot.send_message(camp.user_id, f'🎉 Nouvelle invitation validée !\n+1 minute ajoutée. Nouvelle fin prévue : {active.expires_at:%H:%M}.')
-                    except TelegramError: pass
+                total = await total_valid_invites(db, camp.user_id)
+                rank = rank_for(total)
+                reward = rank.minutes
+                inv.status = InviteStatus.valid
+                camp.valid_invites += 1
+                camp.minutes_earned += reward
+                db.add(MetricEvent(event_type=EventType.invite_valid, pub_group_id=camp.pub_group_id, user_id=camp.user_id))
+                permanent = await challenges.lifetime_grant(db, camp.user_id, camp.vip_group_id)
+                active = await db.scalar(select(VipSession).where(
+                    VipSession.campaign_id == camp.id, VipSession.status == VipSessionStatus.active))
+                if active and active.expires_at and not permanent:
+                    active.expires_at += timedelta(minutes=reward)
+                    active.allocated_minutes += reward
+                    camp.minutes_consumed += reward
+                    notifications.append((camp.user_id,
+                        f'🎉 Invitation validée ! +{reward} minute(s) ajoutée(s) à ta session ({rank.name}).', None))
+                promoted = rank_for(total + 1)
+                if promoted != rank:
+                    notifications.append((camp.user_id,
+                        f'{promoted.icon} Tu atteins le rang {promoted.name} !\n'
+                        f'Tes prochaines invitations validées rapporteront {promoted.minutes} minutes chacune.', None))
+                enrollment = await challenges.enrollment_for(db, camp.id)
+                if enrollment and enrollment.status == 'enrolled':
+                    achieved, _ = await challenges.progress(db, enrollment)
+                    if achieved == challenges.TARGET:
+                        notifications.append((camp.user_id,
+                            '🏆 Objectif du défi atteint ! Tu peux demander ton accès VIP à vie. '
+                            'Il sera accordé uniquement après validation administrateur.',
+                            challenges.keyboard([[('📩 MON DÉFI', 'u:challenge')]])))
             else:
-                inv.status = InviteStatus.invalid; camp.invalid_invites += 1; inv.reason = 'départ avant validation'
-                s.add(MetricEvent(event_type=EventType.invite_invalid, pub_group_id=camp.pub_group_id, user_id=camp.user_id))
-        await s.commit()
+                inv.status, inv.reason = InviteStatus.invalid, 'départ avant validation'
+                camp.invalid_invites += 1
+                db.add(MetricEvent(event_type=EventType.invite_invalid, pub_group_id=camp.pub_group_id, user_id=camp.user_id))
+        await db.commit()
+    for uid, text, markup in notifications:
+        try: await context.bot.send_message(uid, text, reply_markup=markup)
+        except TelegramError: pass
 
 
 async def _kick_and_verify(bot, chat_id: int, user_id: int) -> tuple[bool, str | None]:
-    try:
-        await bot.ban_chat_member(chat_id, user_id)
-        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in (ChatMember.LEFT, ChatMember.BANNED), None
-    except TelegramError as exc:
-        return False, str(exc)
+    async with challenges.access_lock(user_id):
+        if await challenges.has_lifetime(user_id, chat_id):
+            return False, 'lifetime_access'
+        try:
+            await bot.ban_chat_member(chat_id, user_id)
+            await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
+            member = await bot.get_chat_member(chat_id, user_id)
+            return member.status in (ChatMember.LEFT, ChatMember.BANNED), None
+        except TelegramError as exc:
+            return False, str(exc)
 
 
 async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
     async with SessionLocal() as sdb:
         trials = list((await sdb.scalars(select(TrialAccess).where(TrialAccess.status.in_([TrialStatus.active, TrialStatus.kick_pending]), TrialAccess.expires_at <= now()).limit(100))).all())
         for trial in trials:
-            trial.status = TrialStatus.kick_pending
-            trial.kick_attempts += 1
-            ok, error = await _kick_and_verify(context.bot, trial.vip_group_id, trial.user_id)
+            if await challenges.lifetime_grant(sdb, trial.user_id, trial.vip_group_id):
+                trial.status = TrialStatus.cancelled
+                trial.last_kick_error = None
+                continue
             camp = await sdb.get(Campaign, trial.campaign_id)
             available = max(0, camp.minutes_earned - camp.minutes_consumed)
 
@@ -1516,7 +1331,7 @@ async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
                         'Tu as déjà obtenu suffisamment d’invitations.\n'
                         'Ton accès découverte continue automatiquement en accès VIP.\n\n'
                         f'⏱ Temps ajouté : <b>{available} minute(s)</b>\n\n'
-                        'Continue à inviter : chaque nouvelle invitation validée prolongera ton accès d’une minute.',
+                        'Continue à inviter : les nouvelles invitations prolongent ton accès selon ton rang.',
                         parse_mode=ParseMode.HTML,
                         reply_markup=user_menu(False, 0),
                     )
@@ -1524,6 +1339,13 @@ async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
                     pass
                 continue
 
+            trial.status = TrialStatus.kick_pending
+            trial.kick_attempts += 1
+            ok, error = await _kick_and_verify(context.bot, trial.vip_group_id, trial.user_id)
+            if error == 'lifetime_access':
+                trial.status = TrialStatus.cancelled
+                trial.last_kick_error = None
+                continue
             if ok:
                 trial.status = TrialStatus.kicked
                 trial.kick_verified_at = now()
@@ -1536,19 +1358,19 @@ async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
                         '⏳ <b>Ton accès découverte est terminé !</b>\n\n'
                         'Tu as pu découvrir une partie du VIP. Il reste encore beaucoup de contenu à voir.\n\n'
                         'La bonne nouvelle : tu peux revenir gratuitement autant de fois que tu le souhaites.\n\n'
-                        '🎁 <b>1 invitation validée = 1 minute de VIP</b>\n'
-                        f'🔐 Il faut au moins <b>{settings.minimum_minutes} invitations validées</b> pour revenir.\n\n'
+                        '🎁 <b>1 invitation validée = 1 à 5 minutes selon ton rang</b>\n'
+                        f'🔐 Il faut au moins <b>{settings.minimum_minutes} minutes disponibles</b> pour revenir.\n\n'
                         '━━━━━━━━━━━━━━\n'
                         '📊 <b>Ton compteur</b>\n\n'
                         f'✅ Invitations validées : <b>{camp.valid_invites}</b>\n'
                         f'⏳ En vérification : <b>{camp.pending_invites}</b>\n'
                         f'❌ Non validées : <b>{camp.invalid_invites}</b>\n\n'
                         f'⏱ Crédit disponible : <b>{available} minute(s)</b>\n'
-                        f'🎯 Encore <b>{missing}</b> invitation(s) pour revenir dans le VIP.\n\n'
+                        f'🎯 Encore <b>{missing}</b> minute(s) pour revenir dans le VIP.\n\n'
                         '━━━━━━━━━━━━━━\n'
                         '🔗 <b>Ton lien personnel</b>\n\n'
                         f'<code>{camp.invite_link}</code>\n\n'
-                        'Partage-le où tu le souhaites. Chaque personne validée te rapporte une minute.',
+                        'Chaque personne validée te rapporte des minutes selon ton rang.',
                         parse_mode=ParseMode.HTML,
                         reply_markup=user_menu(False, missing),
                         disable_web_page_preview=True,
@@ -1610,7 +1432,7 @@ async def cleanup_expired_vip_links(context: ContextTypes.DEFAULT_TYPE) -> None:
     # peut leur renvoyer immédiatement un panneau corrigé.
     for user_id in affected_users:
         camp = await active_campaign(user_id)
-        if not camp:
+        if not camp or await challenges.has_lifetime(user_id, camp.vip_group_id):
             continue
         remaining = await remaining_minutes(camp)
         missing = max(0, settings.minimum_minutes - remaining)
@@ -1652,9 +1474,17 @@ async def expire_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
     async with SessionLocal() as sdb:
         sessions = list((await sdb.scalars(select(VipSession).where(VipSession.status.in_([VipSessionStatus.active, VipSessionStatus.kick_pending]), VipSession.expires_at <= now()).limit(100))).all())
         for session in sessions:
+            if await challenges.lifetime_grant(sdb, session.user_id, session.vip_group_id):
+                session.status = VipSessionStatus.cancelled
+                session.last_kick_error = None
+                continue
             session.status = VipSessionStatus.kick_pending
             session.kick_attempts += 1
             ok, error = await _kick_and_verify(context.bot, session.vip_group_id, session.user_id)
+            if error == 'lifetime_access':
+                session.status = VipSessionStatus.cancelled
+                session.last_kick_error = None
+                continue
             if ok:
                 session.status = VipSessionStatus.kicked
                 session.last_kick_error = None
@@ -1761,19 +1591,9 @@ async def send_health(message, context) -> None:
         lines.append('')
         lines.append('🔗 Dernier contrôle des liens de campagne')
         lines.append(f'Contrôlés : {link_audit.get("scanned", 0)}')
-        lines.append(f'Liens réparés : {link_audit.get("repaired", 0)}')
-        lines.append(f'Utilisateurs prévenus : {link_audit.get("notified", 0)}')
-        lines.append(f'Groupes à vérifier : {link_audit.get("group_errors", 0)}')
-        lines.append(f'Erreurs : {link_audit.get("errors", 0)}')
-    rotation = context.application.bot_data.get('last_campaign_link_rotation', {})
-    if rotation:
-        lines.append('')
-        lines.append('♻️ Dernière rotation préventive')
-        lines.append(f'Liens examinés : {rotation.get("scanned", 0)}')
-        lines.append(f'Nouveaux liens : {rotation.get("rotated", 0)}')
-        lines.append(f'Utilisateurs prévenus : {rotation.get("notified", 0)}')
-        lines.append(f'Erreurs : {rotation.get("errors", 0)}')
-    lines.append(f'🛡 Âge maximum du lien courant : {settings.campaign_link_max_age_hours} h')
+        lines.append(f'Contrôles réussis : {link_audit.get("healthy", 0)}')
+        lines.append(f'Erreurs de vérification : {link_audit.get("errors", 0)}')
+    lines.append('🔗 Parrainage : liens permanents, aucun renouvellement automatique')
     rec = context.application.bot_data.get('last_lost_reconciliation', {})
     if rec:
         lines.append('')
@@ -1866,6 +1686,7 @@ async def send_global_stats(message) -> None:
 
 async def post_init(app: Application) -> None:
     settings.validate(); await init_db()
+    await announcements.prepare_notice()
     backfilled = await backfill_campaign_link_history()
     if backfilled:
         log.info('Historique des liens de campagne initialisé : %s lien(s)', backfilled)
@@ -1873,6 +1694,7 @@ async def post_init(app: Application) -> None:
         for uid in settings.owner_ids:
             if not await s.get(Admin, uid): s.add(Admin(telegram_id=uid, source='owner'))
         await s.commit()
+    app.job_queue.run_repeating(announcements.deliver_notice_batch, interval=60, first=45, name='release_notice')
     app.job_queue.run_repeating(validate_invites, interval=30, first=10, name='validate_invites')
     app.job_queue.run_repeating(expire_trials, interval=settings.kick_retry_seconds, first=10, name='expire_trials')
     app.job_queue.run_repeating(expire_sessions, interval=settings.kick_retry_seconds, first=15, name='expire_sessions')
@@ -1880,9 +1702,8 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(audit_vip_members, interval=300, first=120, name='audit_vip_members')
     app.job_queue.run_repeating(health_watch, interval=settings.health_interval_minutes * 60, first=30, name='health_watch')
     app.job_queue.run_repeating(campaign_link_watch, interval=settings.campaign_link_audit_minutes * 60, first=90, name='campaign_link_watch')
-    app.job_queue.run_repeating(rotate_stale_campaign_links, interval=settings.campaign_link_audit_minutes * 60, first=150, name='campaign_link_rotation_watch')
     app.job_queue.run_once(reconcile_lost_groups, when=8, name='reconcile_lost_groups_startup')
-    app.job_queue.run_once(startup_campaign_link_repair, when=20, name='startup_campaign_link_repair')
+    app.job_queue.run_once(startup_campaign_link_audit, when=20, name='startup_campaign_link_audit')
 
 
 def build() -> Application:

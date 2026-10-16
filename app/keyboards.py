@@ -6,7 +6,9 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton('🩺 SANTÉ', callback_data='a:health'), InlineKeyboardButton('📊 STATISTIQUES', callback_data='a:stats')],
         [InlineKeyboardButton('👥 GROUPES', callback_data='a:groups'), InlineKeyboardButton('🚫 MOTS INTERDITS', callback_data='a:words')],
         [InlineKeyboardButton('📣 BROADCAST PRIVÉ', callback_data='a:broadcast')],
-        [InlineKeyboardButton('🔎 AUDITER LES LIENS', callback_data='a:repairlinks'), InlineKeyboardButton('♻️ RENOUVELER TOUS', callback_data='a:rotateall')],
+        [InlineKeyboardButton('🏆 DEMANDES VIP À VIE', callback_data='a:ch:queue:0')],
+        [InlineKeyboardButton('📬 BILAN ANNONCE', callback_data='a:notices')],
+        [InlineKeyboardButton('🔎 AUDITER LES LIENS', callback_data='a:repairlinks')],
     ])
 
 
@@ -56,19 +58,25 @@ def choose_vip(pub_id: int, vips) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def user_menu(can_use: bool = False, missing: int = 0, blocked_label: str | None = None) -> InlineKeyboardMarkup:
+def user_menu(can_use: bool = False, missing: int = 0, blocked_label: str | None = None, *, lifetime: bool = False, permanent: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton('📊 MON COMPTEUR', callback_data='u:counter'), InlineKeyboardButton('🔗 MON LIEN', callback_data='u:link')],
     ]
-    if can_use:
+    if permanent:
+        rows.append([InlineKeyboardButton('👑 ACCÉDER AU VIP À VIE', callback_data='u:lifetime')])
+    elif can_use:
         rows.append([InlineKeyboardButton('🔐 UTILISER MES MINUTES', callback_data='u:use')])
     elif blocked_label:
         rows.append([InlineKeyboardButton(blocked_label, callback_data='u:counter')])
     elif missing > 0:
-        rows.append([InlineKeyboardButton(f'🔒 ENCORE {missing} INVITATIONS', callback_data='u:counter')])
+        rows.append([InlineKeyboardButton(f'🔒 ENCORE {missing} MINUTES', callback_data='u:counter')])
     else:
-        # Sécurité d'affichage : ne jamais montrer « ENCORE 0 INVITATIONS ».
+        # Sécurité d'affichage : ne jamais montrer « ENCORE 0 MINUTES ».
         rows.append([InlineKeyboardButton('🔄 ACTUALISER MON ACCÈS', callback_data='u:counter')])
+    if lifetime and not permanent:
+        rows.append([InlineKeyboardButton('👑 MES ACCÈS À VIE', callback_data='u:lifetime')])
+    rows.append([InlineKeyboardButton('🏅 MES RANGS', callback_data='u:ranks')])
+    rows.append([InlineKeyboardButton('🏆 DÉFI VIP À VIE · FACULTATIF', callback_data='u:challenge')])
     rows.append([InlineKeyboardButton('📖 RÈGLES', callback_data='u:rules')])
     return InlineKeyboardMarkup(rows)
 
@@ -90,9 +98,3 @@ def broadcast_confirm() -> InlineKeyboardMarkup:
         [InlineKeyboardButton('❌ ANNULER', callback_data='a:broadcast:cancel')],
     ])
 
-
-def rotate_all_confirm(count: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f'✅ RENOUVELER {count} LIENS', callback_data='a:rotateall:confirm')],
-        [InlineKeyboardButton('❌ ANNULER', callback_data='a:menu')],
-    ])

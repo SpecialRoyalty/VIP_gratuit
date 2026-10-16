@@ -25,9 +25,6 @@ class Settings:
     timezone: str = os.environ.get('TIMEZONE', 'Europe/Paris')
     campaign_link_audit_minutes: int = int(os.environ.get('CAMPAIGN_LINK_AUDIT_MINUTES', '10'))
     campaign_link_audit_batch: int = int(os.environ.get('CAMPAIGN_LINK_AUDIT_BATCH', '100'))
-    campaign_link_max_age_hours: int = int(os.environ.get('CAMPAIGN_LINK_MAX_AGE_HOURS', '168'))
-    campaign_link_refresh_minutes: int = int(os.environ.get('CAMPAIGN_LINK_REFRESH_MINUTES', '30'))
-    campaign_link_rotation_batch: int = int(os.environ.get('CAMPAIGN_LINK_ROTATION_BATCH', '100'))
 
     def validate(self) -> None:
         missing = []
