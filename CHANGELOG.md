@@ -1,3 +1,26 @@
+# V6.0 — Rangs et défi VIP à vie
+
+- Bronze 0 / Silver 50 / Gold 150 / Platine 300 / Omega 500 : de 1 à 5 minutes par nouvelle invitation validée.
+- Rang cumulatif, indépendant de la participation au défi, sans recalcul des anciens crédits.
+- Défi facultatif de 200 arrivées postérieures à l'inscription, avec progression, justificatifs et décision administrateur.
+- Droits VIP permanents nominatifs par groupe ; protection contre les expulsions temporisées et les boutons de dépenses anciens.
+- Annonce unique aux utilisateurs déjà enregistrés au premier déploiement, avec suivi persistant et bilan admin.
+- Nouvelles tables créées automatiquement sans modifier le schéma des tables existantes depuis V5.4/V5.5.
+- Correction de l'ordre essai → session créditée : aucune expulsion avant la conversion.
+- Une erreur de vérification Telegram laisse l'invitation en attente.
+- Utilisation de l'heure réelle de l'arrivée Telegram pour le défi, même en cas d'événement retardé.
+
+# V5.5 — Liens de parrainage permanents
+
+- Suppression des rotations périodiques, sur clic utilisateur, au démarrage et après échec d'audit.
+- Suppression du renouvellement global ; anciens boutons neutralisés.
+- Liens PUB créés sans expiration ni quota ; contrôle du même lien avec suppression des limites.
+- Audits silencieux, erreurs exactes réservées aux administrateurs avec déduplication persistante et rappel après 24 h.
+- Respect de RetryAfter : pause des audits sans remplacement de lien.
+- Conservation des anciennes URL, de l'attribution, des compteurs et des minutes.
+- Perte des droits seule : aucune libération automatique des campagnes.
+- Tests de régression hors ligne ; aucune migration SQL depuis V5.4.
+
 # Changelog
 
 ## 5.3.0

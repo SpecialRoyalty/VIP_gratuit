@@ -1,136 +1,138 @@
-# Bot Telegram VIP à la minute V3 — Railway + PostgreSQL
+# Bot Telegram VIP — V6.0
 
-## Parcours utilisateur
+Liens de parrainage permanents, minutes selon le rang et défi facultatif VIP à vie, avec validation administrateur.
 
-1. Une publicité est publiée dans un groupe PUB avec son image, son texte et le bouton unique **🎁 VIP GRATUIT**.
-2. Le bouton ouvre le bot en privé et mémorise définitivement le premier groupe PUB utilisé. Un simple `/start` renvoie également le lien découverte lorsqu’une campagne existante n’a encore jamais profité de l’essai.
-3. Le bot crée immédiatement un lien personnel vers le VIP, sans afficher les conditions.
-4. Le délai découverte commence uniquement lorsque Telegram confirme l'entrée réelle dans le VIP.
-5. Après `TRIAL_MINUTES` (2 minutes par défaut), le bot retire l'utilisateur, vérifie l'expulsion puis lui envoie les conditions et son lien de parrainage.
-6. Une invitation validée rapporte une minute. Il faut au moins 10 minutes disponibles pour démarrer une nouvelle session VIP.
-7. Les invitations validées pendant une session payée prolongent la session d'une minute.
+## Mise à jour depuis V5.4 ou V5.5
 
-L'essai découverte ne peut être utilisé qu'une fois. Un lien découverte expiré avant utilisation peut être recréé.
+1. Remplacer l'ancien code par le contenu de cette archive et redéployer.
+2. Conserver le même `BOT_TOKEN`, les mêmes `OWNER_IDS` et la même `DATABASE_URL`. Ne pas recréer ni vider la base.
+3. Arrêter l'ancienne instance lors du redéploiement. Une seule instance du bot doit fonctionner ; les envois et les décisions sont conçus pour ce mode.
+4. Les cinq nouvelles tables sont créées automatiquement au démarrage : `challenge_enrollments`, `challenge_evidence`, `lifetime_accesses`, `release_notices`, `release_notice_deliveries`. Aucun changement de colonne ou d'enum existant n'est requis depuis V5.4/V5.5.
+5. Les anciennes variables `CAMPAIGN_LINK_MAX_AGE_HOURS`, `CAMPAIGN_LINK_REFRESH_MINUTES` et `CAMPAIGN_LINK_ROTATION_BATCH` sont ignorées et peuvent être supprimées.
 
-## Notifications d'entrée et de sortie
+Les utilisateurs, liens, minutes, invitations et campagnes existants sont conservés. Le déploiement lance l'annonce unique décrite ci-dessous. Le ZIP n'exécute rien tant qu'il n'est pas déployé.
 
-Dans les groupes configurés en VIP, le bot supprime automatiquement les messages de service Telegram du type « X a rejoint le groupe » et « X a quitté le groupe ».
+## Barème des rangs
 
-Le bot doit être administrateur du VIP avec les droits :
+| Rang | Invitations déjà validées, cumulées | Minutes par nouvelle invitation |
+| --- | ---: | ---: |
+| Bronze | 0 à 49 | 1 |
+| Silver | 50 à 149 | 2 |
+| Gold | 150 à 299 | 3 |
+| Platine | 300 à 499 | 4 |
+| Omega | 500 et plus | 5 |
 
-- inviter des utilisateurs ;
-- bannir/restreindre des membres ;
-- supprimer les messages.
+Le cumul comprend les anciennes campagnes de la personne, même clôturées. Dépenser des minutes ne diminue pas le rang. Les utilisateurs existants bénéficient du tarif correspondant à leur cumul pour leurs prochaines invitations ; aucun gain passé n'est recalculé.
 
-## Contrôle des expulsions
+Le tarif est celui du rang avant la nouvelle validation : la 50e invitation rapporte encore 1 minute ; les 51e et suivantes rapportent 2 minutes jusqu'au prochain rang. Le même principe s'applique aux seuils 150, 300 et 500. Les validations sont traitées par échéance puis par identifiant.
 
-- tentative d'expulsion toutes les `KICK_RETRY_SECONDS` secondes ;
-- bannissement puis débannissement afin de permettre une future réentrée ;
-- vérification immédiate du statut Telegram après l'opération ;
-- conservation du statut `kick_pending` tant que Telegram ne confirme pas la sortie ;
-- alerte administrateur à la première erreur puis toutes les trois tentatives ;
-- audit récapitulatif toutes les cinq minutes ;
-- compteur des expulsions en attente dans **🩺 SANTÉ**.
+Le bouton **MES RANGS** détaille le barème. **MON COMPTEUR** affiche le rang, le tarif, les invitations cumulées, une barre vers le prochain rang, les statistiques de la campagne et le crédit restant.
 
-## Bouton Santé
+Les rangs sont automatiques, indépendants du défi. Omega donne 5 minutes par invitation, jamais un accès à vie.
 
-Le bouton **🩺 SANTÉ** contrôle :
+## Parcours habituel
 
-- Telegram ;
-- PostgreSQL ;
-- présence d'au moins un groupe PUB ;
-- présence d'au moins un VIP ;
-- droits du bot dans chaque groupe ;
-- droit de suppression des messages dans le VIP ;
-- association de chaque PUB à un VIP ;
-- essais et sessions restant à expulser.
+1. L'administrateur publie une publicité dans un groupe PUB avec le bouton **VIP GRATUIT**.
+2. Le bot crée une campagne et un lien de parrainage vers ce groupe. Une seule campagne est active par personne.
+3. Une découverte du VIP est proposée une seule fois. Ses 2 minutes par défaut commencent lors de l'entrée réelle.
+4. À la fin de l'essai, le bot expulse l'utilisateur puis lui présente le fonctionnement et son lien. Si le crédit atteint déjà le minimum, il convertit l'essai en session normale **avant toute expulsion**.
+5. Une nouvelle personne rejoignant le PUB via le lien doit rester au moins 5 minutes par défaut pour que l'invitation soit validée. Les auto-invitations, doublons et bots ne donnent pas de crédit ; le filtre de profils existant reste en place.
+6. Chaque invitation validée rapporte 1 à 5 minutes selon le rang.
+7. À partir de 10 minutes disponibles par défaut, l'utilisateur peut demander un lien personnel vers le VIP. Le compte à rebours commence à son entrée réelle.
+8. Les invitations validées pendant une session prolongent celle-ci du nombre de minutes correspondant au rang, sans créditer deux fois les mêmes minutes.
+9. À expiration, le bot retire l'utilisateur et vérifie la sortie. Une erreur Telegram pendant la vérification d'un invité laisse son invitation en attente, sans l'invalider arbitrairement.
 
-Une surveillance automatique avertit les administrateurs lorsqu'un groupe devient inaccessible, lorsque le bot perd ses droits ou lorsqu'une association PUB/VIP manque.
+## Défi VIP à vie — facultatif
 
-## Raccordement non autorisé
+Le menu propose **DÉFI VIP À VIE · FACULTATIF**. Consulter cette page n'inscrit personne : il faut cliquer sur **JE PARTICIPE**.
 
-Si un non-administrateur autorisé ajoute le bot dans un groupe, le bot tente de récupérer un lien du groupe, transmet le groupe, l'auteur et le lien aux administrateurs, écrit **Garde la pêche 👋**, puis quitte le groupe.
+- Objectif : 200 nouvelles invitations validées de personnes provenant de Leakmedia ou Discord, dans la campagne inscrite.
+- Le même lien de parrainage est utilisé. Les anciennes URL encore actives et rattachées à cette campagne continuent également de fonctionner.
+- Seules les arrivées après l'inscription comptent. Une arrivée antérieure ne compte pas même si sa validation ou la réception de l'événement Telegram est tardive.
+- Les invitations du défi font aussi gagner les minutes et progresser le rang.
+- La page affiche les invitations validées, en attente, la barre sur 200 et les justificatifs enregistrés.
+- L'utilisateur peut transmettre un texte (3 000 caractères maximum) ou une photo avec légende via **AJOUTER UN JUSTIFICATIF**. Les administrateurs peuvent consulter ces pièces.
+- À 200 validations, l'utilisateur peut cliquer sur **DEMANDER MON ACCÈS À VIE**. Le statut devient « en attente », sans accorder de droit automatique.
+- La provenance Leakmedia/Discord n'est pas détectée automatiquement : elle est vérifiée par l'administrateur, à partir du dossier et des justificatifs.
 
-## Déploiement Railway
+### Décision administrateur
 
-1. Créer un projet Railway.
-2. Ajouter PostgreSQL.
-3. Déployer ce dépôt ou cette archive.
-4. Ajouter les variables de `.env.example` dans Railway.
-5. Mettre votre identifiant Telegram dans `OWNER_IDS`.
-6. Ajouter le bot dans les groupes, le promouvoir administrateur, puis utiliser `/start` en privé.
-7. Classer les groupes avec le panneau : PUB ou VIP.
-8. Pour chaque PUB, configurer le texte, l'image et le VIP associé, puis publier.
+Le panneau contient **DEMANDES VIP À VIE**. Chaque demande indique la personne, le groupe PUB, le VIP visé, le nombre d'invitations depuis l'inscription, les justificatifs et son statut.
 
-## Base existante
+- **APPROUVER** affiche une confirmation explicite de la vérification de provenance et de l'attribution à vie.
+- **REFUSER** demande un motif, communiqué à l'utilisateur et conservé en base.
+- Après un refus, un nouvel examen nécessite au moins un nouveau justificatif. Les boutons liés à une ancienne demande sont neutralisés.
+- Les demandes sont persistantes et accessibles depuis le panneau même si leur notification privée a échoué.
 
-Cette version ajoute la table `trial_accesses` et de nouvelles valeurs d'événements. Sur une installation de test, le plus simple est d'utiliser une nouvelle base PostgreSQL. Pour une base contenant déjà des données importantes, effectuer une migration SQL contrôlée avant le redéploiement.
+### Accès permanent
 
+L'approbation crée un droit nominatif pour le **VIP associé au défi**. Ce droit n'a pas de durée ; il ne se transfère pas automatiquement à d'autres VIP. Les minuteurs existants de ce VIP sont annulés, et les contrôles d'expulsion vérifient aussi le droit permanent avant d'agir.
 
-## Correctif V3
+Le bouton **MES ACCÈS À VIE** permet de rejoindre le VIP. Son lien d'entrée personnel dure 15 minutes par défaut et accepte une personne : c'est le **droit d'accès** qui est permanent. Le titulaire peut demander un nouveau lien d'entrée sans dépenser de minutes. Une personne non bénéficiaire utilisant ce lien ne reçoit pas le droit d'accès.
 
-La V3 corrige le cas visible dans la capture où `/start` affichait directement le compteur pour une campagne créée avant l’ajout de l’essai. Tant qu’aucun essai n’a été commencé ou terminé, le bot génère maintenant le lien découverte de `TRIAL_MINUTES`, y compris sur un simple `/start`.
+Si le groupe PUB de la campagne disparaît, un défi non approuvé est annulé. Un droit déjà approuvé pour un VIP reste acquis tant que ce VIP est disponible. Les rangs cumulés ne sont pas remis à zéro.
 
-## Fin de l’accès découverte
+## Annonce unique au premier déploiement V6
 
-À la fin de l’essai, le bot affiche automatiquement le compteur réel et le lien personnel de l’utilisateur.
-Si le crédit disponible atteint déjà le seuil `MINIMUM_VIP_MINUTES`, l’utilisateur n’est pas expulsé : l’essai devient directement une session VIP normale.
+La liste des utilisateurs déjà enregistrés au premier démarrage V6 est figée en base. Le bot leur annonce les liens stables, la conservation des compteurs, les rangs et le défi facultatif. Il joint le lien actuel lorsqu'une campagne active existe ; sinon il indique comment reprendre depuis un groupe partenaire.
 
-## Libération automatique après perte d'un groupe PUB
+- Les envois commencent environ 45 secondes après démarrage, par lots de 25 par minute.
+- Le statut de chaque envoi est enregistré : un redémarrage ou un nouveau push ne relance pas les messages déjà envoyés.
+- Les utilisateurs qui s'inscrivent après ce premier déploiement ne reçoivent pas cette ancienne annonce.
+- Les destinataires qui ont bloqué le bot ou les envois définitivement refusés sont marqués en échec.
+- Si une erreur réseau ou un arrêt du processus rend la remise incertaine, le bot ne renvoie pas automatiquement le message, pour éviter les doublons. Une remise à tous ne peut donc pas être garantie.
+- Les limites Telegram reportent toute la file jusqu'à l'échéance indiquée.
+- **BILAN ANNONCE** affiche les nombres envoyés, en attente, en cours, en échec et incertains.
 
-Lorsqu'un groupe PUB est réellement inaccessible pendant le délai configuré, le bot clôture les campagnes actives liées à ce groupe, révoque les liens encore actifs, annule les invitations en attente et libère automatiquement les utilisateurs. Une réconciliation est lancée au démarrage pour corriger également les anciennes campagnes bloquées.
+## Liens de parrainage permanents et contrôles silencieux
 
-Variable :
+Les liens de parrainage PUB sont créés sans expiration ni quota de membres. Aucun renouvellement n'est déclenché par leur âge, par **MON LIEN**, par le démarrage ou par une erreur d'audit. Les anciennes URL partagées continuent d'attribuer les invitations à la même campagne.
 
-```env
-GROUP_LOST_GRACE_MINUTES=10
+L'audit vérifie le lien courant en éditant ses paramètres sans changer son URL, avec `expire_date=0`, `member_limit=0` et sans demande d'adhésion. La Bot API ne propose pas de test de clic ; un contrôle réussi ne garantit pas l'accès d'une personne particulière.
+
+- En cas de réussite : aucun message.
+- En cas d'échec : alerte réservée aux administrateurs avec groupe, utilisateur, lien et erreur exacte. Aucun remplacement ni message à l'utilisateur.
+- Même erreur : rappel au plus une fois par 24 heures, avec déduplication persistante. Un changement d'erreur ou une nouvelle panne après rétablissement peut déclencher une alerte.
+- **AUDITER LES LIENS** lance le même contrôle. Les anciens boutons de renouvellement ne peuvent plus changer les liens.
+- Une simple perte de droits ne clôture plus la campagne. Un groupe réellement perdu ou supprimé manuellement peut toujours entraîner sa clôture et la révocation des liens associés.
+
+Un lien sans expiration peut toujours devenir inutilisable après une révocation manuelle ou la disparition du groupe.
+
+## Configuration et administration
+
+Voir `env.example` pour les paramètres. Les variables obligatoires sont `BOT_TOKEN`, `OWNER_IDS` et `DATABASE_URL`.
+
+| Paramètre | Défaut | Usage |
+| --- | ---: | --- |
+| `JOIN_VALIDATION_MINUTES` | 5 | Présence minimale des invités |
+| `MINIMUM_VIP_MINUTES` | 10 | Crédit minimum d'une nouvelle session |
+| `TRIAL_MINUTES` | 2 | Découverte VIP |
+| `VIP_LINK_TTL_MINUTES` | 15 | Validité des liens personnels d'entrée VIP |
+| `KICK_RETRY_SECONDS` | 20 | Vérification des sorties dues |
+| `CAMPAIGN_LINK_AUDIT_MINUTES` | 10 | Fréquence des audits de liens PUB |
+| `CAMPAIGN_LINK_AUDIT_BATCH` | 100 | Taille des lots d'audit |
+| `GROUP_LOST_GRACE_MINUTES` | 10 | Délai de réconciliation des groupes perdus |
+
+Le bot doit être administrateur des groupes, avec les droits d'invitation et de restriction ; le VIP nécessite aussi le droit de suppression des messages. Le bot supprime les notifications de service d'entrée/sortie dans les VIP.
+
+Le panneau conserve la gestion des groupes, les publicités avec image, les statistiques, les mots interdits, le broadcast privé avec confirmation, les contrôles de santé et les opérations de désactivation/suppression de groupes.
+
+Le filtre de noms et pseudos ne prouve ni la nationalité d'une personne ni sa provenance Discord/Leakmedia.
+
+## Installation neuve
+
+1. Préparer une base PostgreSQL et renseigner les variables de `env.example` sur l'hébergement.
+2. Installer `requirements.txt` et lancer `python -m app.main` (ou utiliser le Dockerfile/Procfile fourni).
+3. Ajouter le bot aux groupes et lui donner les droits requis.
+4. Ouvrir `/start` en privé avec un compte présent dans `OWNER_IDS`.
+5. Classer les groupes en PUB/VIP, associer chaque PUB à un VIP, configurer la publicité et publier.
+
+## Vérifications hors ligne
+
+```bash
+pip install -r requirements.txt
+pip install aiosqlite
+python -m unittest discover -s tests -v
 ```
 
-Un simple VIP non associé est considéré comme une configuration incomplète et non comme une perte de connexion.
-
-## Broadcast privé
-
-Le bouton `📣 BROADCAST PRIVÉ` permet à un administrateur d'envoyer un texte ou une photo à tous les utilisateurs enregistrés. Le bot affiche un aperçu, demande confirmation, respecte un délai entre les messages et fournit un rapport final.
-
-```env
-BROADCAST_DELAY_SECONDS=0.05
-```
-
-## Correctif 5.1 — liens VIP expirés
-
-Au démarrage, le bot recherche globalement les anciennes sessions `link_created` dont le lien est expiré. Elles sont marquées `expired`, les liens sont révoqués lorsque possible et les utilisateurs concernés reçoivent automatiquement un panneau actualisé. Ils n'ont pas besoin de refaire `/start`.
-
-Le même contrôle est relancé toutes les 30 secondes. Le bouton `🩺 SANTÉ` affiche le dernier bilan de cette correction.
-
-## Réparation automatique des liens de campagne (V5.2)
-
-Le panneau administrateur contient `🛠 RÉPARER LES LIENS`. Ce bouton audite toutes les campagnes actives, vérifie leurs liens de parrainage auprès de Telegram, recrée les liens devenus invalides et envoie automatiquement le nouveau lien aux utilisateurs concernés. Les compteurs, minutes et invitations sont conservés.
-
-Le même contrôle est exécuté automatiquement au démarrage puis en continu par lots. Les variables `CAMPAIGN_LINK_AUDIT_MINUTES` et `CAMPAIGN_LINK_AUDIT_BATCH` règlent la fréquence et la taille de chaque lot. Le bouton utilisateur `🔗 MON LIEN` effectue également une vérification à la demande avant d'afficher le lien.
-
-## V5.3 — sécurité des liens de parrainage
-
-Les liens de campagne sont maintenant versionnés dans `campaign_invite_links`. Lorsqu'un lien est renouvelé, l'ancien n'est pas automatiquement révoqué : s'il avait déjà été partagé et fonctionne encore, toute nouvelle entrée via cet ancien lien reste attribuée à la même campagne.
-
-Le panneau admin contient **♻️ RENOUVELER TOUS**. Il affiche d'abord le nombre de campagnes actives, demande confirmation, crée un nouveau lien sans expiration pour chaque campagne, met à jour le lien courant et envoie le nouveau lien aux utilisateurs. Un rapport final indique le nombre de liens créés, les utilisateurs prévenus et les erreurs.
-
-`MON LIEN` renouvelle automatiquement un lien courant trop ancien. En plus, une rotation préventive s'exécute en arrière-plan pour éviter de conserver indéfiniment une URL courante.
-
-Variables :
-
-```env
-CAMPAIGN_LINK_REFRESH_MINUTES=30
-CAMPAIGN_LINK_MAX_AGE_HOURS=168
-CAMPAIGN_LINK_ROTATION_BATCH=100
-```
-
-La table `campaign_invite_links` est créée automatiquement au premier démarrage de cette version, puis les liens existants sont importés sans toucher aux campagnes ou aux compteurs.
-
-## Suppression manuelle d'un groupe PUB (V5.4)
-Dans **👥 GROUPES**, ouvrir un groupe PUB puis choisir :
-
-- **⏸ DÉSACTIVER** : bloque seulement les nouvelles campagnes ; les campagnes déjà actives continuent.
-- **▶️ RÉACTIVER** : remet le groupe en service après vérification des droits du bot.
-- **🗑 SUPPRIMER & LIBÉRER** : affiche un bilan avant confirmation, puis clôture toutes les campagnes actives du groupe, révoque leurs liens, annule les invitations en attente, libère les utilisateurs et débranche le bot du groupe.
-
-Les utilisateurs libérés n'ont aucune action spéciale à faire : leur prochain clic sur **🎁 VIP GRATUIT** depuis un autre groupe PUB crée automatiquement une nouvelle campagne.
+Les tests utilisent un bot simulé et une base SQLite en mémoire, jamais Telegram ni la base de production. Ils couvrent les liens stables, les rangs et leurs seuils, les bonus de session, l'inscription volontaire, les arrivées tardives, les décisions admin, les droits permanents, les expulsions et les envois uniques. Les verrous PostgreSQL et la remise réelle de messages restent à observer après déploiement.
