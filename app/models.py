@@ -124,6 +124,13 @@ class Campaign(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class CampaignReferral(Base):
+    __tablename__ = 'campaign_referrals'
+    campaign_id: Mapped[int] = mapped_column(Integer, ForeignKey('campaigns.id'), primary_key=True)
+    token: Mapped[str] = mapped_column(String(32), unique=True)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CampaignInviteLink(Base):
     """Historique des liens de parrainage d'une campagne.
 

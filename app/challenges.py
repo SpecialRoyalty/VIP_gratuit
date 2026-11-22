@@ -110,7 +110,7 @@ async def show_challenge(message, user_id):
         return
     text = (f'🏆 <b>Mon défi VIP à vie</b>\n\n'
             f'<b>{valid} / {TARGET} invitations validées</b>\n'
-            f'{progress_bar(valid, TARGET)} {min(100, valid*100//TARGET)} %\n\n'
+            f'{progress_bar(valid, TARGET)}\n\n'
             f'⏳ En vérification : {pending}\n'
             f'🎯 Encore {max(0, TARGET-valid)} invitation(s)\n'
             f'📎 Justificatifs enregistrés : {proofs}\n\n')

@@ -30,8 +30,11 @@ def next_rank(total: int) -> Rank | None:
 
 
 def progress_bar(value: int, target: int, size: int = 10) -> str:
-    filled = min(size, max(0, value) * size // max(1, target))
-    return '🟩' * filled + '⬜' * (size - filled)
+    target = max(1, target)
+    value = min(target, max(0, value))
+    filled = value * size // target
+    percent = value * 100 // target
+    return f'<code>{"▰" * filled}{"▱" * (size - filled)}</code>  <b>{percent} %</b>'
 
 
 async def total_valid_invites(db, user_id: int) -> int:

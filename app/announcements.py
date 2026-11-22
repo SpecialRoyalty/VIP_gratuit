@@ -2,14 +2,15 @@
 from __future__ import annotations
 import asyncio
 from datetime import timedelta
-from html import escape
 
 from sqlalchemy import exists, func, insert, literal, select
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 
 from .db import SessionLocal
+from .keyboards import referral_actions
 from .models import ReleaseNotice, ReleaseNoticeDelivery, User
+from .referrals import clickable_url, share_url
 from .services import active_campaign, now
 from .challenges import keyboard
 
@@ -64,21 +65,22 @@ async def deliver_notice_batch(context):
                 uid = delivery.user_id
             camp = await active_campaign(uid)
             text = ('🔗 <b>Ton lien de parrainage devient stable</b>\n\n'
-                    'Les renouvellements automatiques sont supprimés. '
-                    'Les liens de parrainage sont sans expiration ni limite d’invités.\n'
+                    'Ton lien ouvre le bot, qui aide tes invités à rejoindre le groupe partenaire.\n'
                     'Tes minutes et tes invitations sont conservées.\n\n')
+            menu = keyboard([[('📊 MON ESPACE', 'u:counter')], [('🏅 LES RANGS', 'u:ranks')]])
             if camp:
-                text += f'Voici ton lien actuel à conserver :\n<code>{escape(camp.invite_link)}</code>\n\n'
+                link = await share_url(context.bot, camp.id)
+                text += f'Voici ton lien à conserver\n{clickable_url(link)}\n\n'
+                menu = referral_actions(link, menu)
             else:
                 text += 'Pour reprendre, ouvre « VIP GRATUIT » depuis un groupe partenaire et obtiens ton lien personnel.\n\n'
             text += ('🏅 De nouveaux rangs récompensent tes invitations : Bronze, Silver, Gold, Platine et Omega.\n'
                      '🏆 Un défi VIP à vie est disponible, uniquement si tu choisis d’y participer.\n\n'
-                     'Un groupe supprimé ou une révocation manuelle peut toujours rendre un lien inutilisable.')
+                     'Ton lien de parrainage fonctionne tant que ta campagne et le groupe partenaire sont actifs.')
             status, error, retry_at = 'sent', None, None
             try:
                 await context.bot.send_message(uid, text, parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                    reply_markup=keyboard([[('📊 MON ESPACE', 'u:counter')], [('🏅 LES RANGS', 'u:ranks')]]))
+                    disable_web_page_preview=True, reply_markup=menu)
             except RetryAfter as exc:
                 status, error = 'pending', f'{type(exc).__name__}: {exc}'
                 delay = exc.retry_after

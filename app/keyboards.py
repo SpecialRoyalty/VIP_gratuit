@@ -1,4 +1,8 @@
+from urllib.parse import urlencode
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+REFERRAL_SAMPLE_SIZES = (5, 10, 20)
 
 
 def admin_menu() -> InlineKeyboardMarkup:
@@ -8,8 +12,25 @@ def admin_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton('📣 BROADCAST PRIVÉ', callback_data='a:broadcast')],
         [InlineKeyboardButton('🏆 DEMANDES VIP À VIE', callback_data='a:ch:queue:0')],
         [InlineKeyboardButton('📬 BILAN ANNONCE', callback_data='a:notices')],
-        [InlineKeyboardButton('🔎 AUDITER LES LIENS', callback_data='a:repairlinks')],
+        [InlineKeyboardButton('🔗 VÉRIFIER LES LIENS RÉCENTS', callback_data='a:referrals:10')],
     ])
+
+
+def recent_referrals_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(size), callback_data=f'a:referrals:{size}')
+         for size in REFERRAL_SAMPLE_SIZES],
+        [InlineKeyboardButton('⬅️ MENU ADMIN', callback_data='a:menu')],
+    ])
+
+
+def referral_actions(link: str, menu: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
+    share = 'https://t.me/share/url?' + urlencode({'url': link})
+    rows = [
+        [InlineKeyboardButton('↗️ Partager mon lien', url=share)],
+        [InlineKeyboardButton('🛠 Mon lien ne marche pas', callback_data='u:checkref')],
+    ]
+    return InlineKeyboardMarkup(rows + (list(menu.inline_keyboard) if menu else []))
 
 
 def group_list(rows) -> InlineKeyboardMarkup:
