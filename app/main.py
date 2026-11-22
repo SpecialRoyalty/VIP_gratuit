@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import hashlib
-from dataclasses import dataclass
 from html import escape
 from datetime import timedelta
 
@@ -19,7 +17,7 @@ from . import challenges, announcements, referrals
 from .ranks import rank_for, rank_summary, rank_rules, total_valid_invites
 from .db import SessionLocal, engine, init_db
 from .keyboards import REFERRAL_SAMPLE_SIZES, admin_menu, broadcast_confirm, choose_vip, group_list, manage_pub, delete_pub_confirm, pending_group, recent_referrals_menu, referral_actions, start_campaign, user_menu, vip_confirm
-from .models import Admin, ChallengeEnrollment, Campaign, CampaignInviteLink, CampaignReferral, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, HealthAlert, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
+from .models import Admin, ChallengeEnrollment, Campaign, CampaignInviteLink, CampaignReferral, CampaignStatus, EventType, ForbiddenWord, Group, GroupRole, Invite, InviteStatus, MetricEvent, TrialAccess, TrialStatus, User, VipSession, VipSessionStatus
 from .services import active_campaign, active_session, bot_rights, ensure_user, forbidden_match, is_admin, now, public_group_link, record, remaining_minutes, token
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -93,178 +91,18 @@ async def backfill_campaign_link_history() -> int:
 
 # Un seul contrôle admin par lot à la fois.
 _campaign_audit_lock = asyncio.Lock()
-_campaign_audit_retry_at = None
 
 
-async def create_permanent_campaign_link(bot, group_id: int, user_id: int):
-    """Un seul lien de parrainage, sans date d'expiration ni quota de membres."""
-    return await bot.create_chat_invite_link(
-        chat_id=group_id,
-        name=f'parrain-{user_id}'[:32],
-        expire_date=None,
-        member_limit=None,
-        creates_join_request=False,
-    )
-
-
-async def report_campaign_link_check(bot, campaign, group, reason: str | None) -> None:
-    """Conserve l'erreur exacte et déduplique les alertes, même après redémarrage."""
-    current = now()
-    prefix = f'campaign-link:{campaign.id}:'
-    fingerprint = prefix + hashlib.sha256((reason or '').encode()).hexdigest()
-    alert_needed = False
-    async with SessionLocal() as sdb:
-        row = await sdb.scalar(select(CampaignInviteLink).where(
-            CampaignInviteLink.invite_link == campaign.invite_link
-        ))
-        if row:
-            row.last_checked_at = current
-            row.last_error = reason
-        alerts = list((await sdb.scalars(select(HealthAlert).where(
-            HealthAlert.fingerprint.startswith(prefix), HealthAlert.resolved.is_(False)
-        ))).all())
-        # Une même erreur est rappelée au plus une fois par 24 heures.
-        recent = await sdb.scalar(select(HealthAlert.id).where(
-            HealthAlert.fingerprint == fingerprint,
-            HealthAlert.resolved.is_(False),
-            HealthAlert.created_at > current - timedelta(hours=24),
-        ).limit(1))
-        for alert in alerts:
-            if reason is None or alert.fingerprint != fingerprint or not recent:
-                alert.resolved = True
-                alert.resolved_at = current
-        if reason is not None and not recent:
-            sdb.add(HealthAlert(group_id=campaign.pub_group_id,
-                              fingerprint=fingerprint, created_at=current))
-            alert_needed = True
-        await sdb.commit()
-    if alert_needed:
-        title = group.title if group else 'Groupe absent de la base'
-        await notify_admins(
-            bot,
-            '⚠️ <b>Vérification du lien de parrainage en échec</b>\n\n'
-            f'Groupe : {escape(title)}\n'
-            f'ID groupe : <code>{campaign.pub_group_id}</code>\n'
-            f'Utilisateur : <code>{campaign.user_id}</code>\n'
-            f'Campagne : <code>{campaign.id}</code>\n'
-            f'Lien : <code>{escape(campaign.invite_link)}</code>\n'
-            f'Erreur : <code>{escape(reason)}</code>\n\n'
-            'L’adresse de parrainage dans le bot reste la même.\n'
-            'Un échec de vérification ne prouve pas que le lien est inutilisable.',
-        )
-
-
-async def replace_invalid_campaign_link(bot, campaign: Campaign, reason: str) -> str | None:
-    created = None
-    try:
-        async with SessionLocal() as db:
-            current = await db.scalar(select(Campaign).where(
-                Campaign.id == campaign.id, Campaign.status == CampaignStatus.active,
-            ).with_for_update())
-            if not current:
-                return None
-            group = await db.get(Group, current.pub_group_id)
-            if not group or group.role != GroupRole.pub or not group.authorized:
-                return None
-            if current.invite_link != campaign.invite_link:
-                return current.invite_link
-
-            created = await create_permanent_campaign_link(bot, current.pub_group_id, current.user_id)
-            old = await db.scalar(select(CampaignInviteLink).where(
-                CampaignInviteLink.invite_link == current.invite_link,
-            ))
-            if old is None:
-                old = CampaignInviteLink(campaign_id=current.id, invite_link=current.invite_link)
-                db.add(old)
-            old.is_current = False
-            old.revoked = True
-            old.replaced_at = old.last_checked_at = now()
-            old.last_error = reason
-            current.invite_link = created.invite_link
-            db.add(CampaignInviteLink(campaign_id=current.id, invite_link=created.invite_link,
-                                      last_checked_at=now()))
-            await db.commit()
-            return created.invite_link
-    except Exception:
-        if created is not None:
-            await _safe_revoke(bot, campaign.pub_group_id, created.invite_link)
-        raise
-
-
-@dataclass(frozen=True)
-class ReferralCheck:
-    link: str | None = None
-    reason: str | None = None
-    replaced: bool = False
-    throttled: bool = False
-
-
-async def audit_campaign_link(bot, campaign: Campaign, *, repair: bool) -> ReferralCheck:
-    """Contrôle l'invitation du groupe et la répare sur demande."""
-    global _campaign_audit_retry_at
-    if _campaign_audit_retry_at and now() < _campaign_audit_retry_at:
-        return ReferralCheck(reason='Limite Telegram atteinte. Réessaie dans quelques instants.', throttled=True)
-    async with SessionLocal() as sdb:
-        camp = await sdb.get(Campaign, campaign.id)
-        if not camp or camp.status != CampaignStatus.active:
-            return ReferralCheck(reason='Campagne inactive.')
-        group = await sdb.get(Group, camp.pub_group_id)
-    reason = None
-    retry_later = False
-    replaced = False
-    if not group or group.role != GroupRole.pub or not group.authorized:
-        reason = 'Configuration : groupe PUB absent ou non configuré'
+def referral_message(result: referrals.LinkCheck, menu: InlineKeyboardMarkup | None = None):
+    if result.link:
+        text = f'🔗 <b>Ton lien direct vers le groupe partenaire</b>\n\n{referrals.clickable_url(result.link)}'
+        if result.replaced:
+            text += '\n\n✅ Voici ton nouveau lien. Partage cette adresse pour les prochaines invitations.'
+    elif result.throttled:
+        text = '⏳ Telegram limite les vérifications. Réessaie dans quelques instants.'
     else:
-        try:
-            invalid_reason = None
-            try:
-                checked = await bot.edit_chat_invite_link(
-                    chat_id=camp.pub_group_id,
-                    invite_link=camp.invite_link,
-                    name=f'parrain-{camp.user_id}'[:32],
-                    expire_date=0,
-                    member_limit=0,
-                    creates_join_request=False,
-                )
-            except BadRequest as exc:
-                if str(exc).casefold() not in {
-                    'invite_hash_expired', 'invite_hash_invalid', 'invite link expired',
-                    'invite link is expired', 'invite link not found', 'invite link is invalid',
-                    'invite link is revoked',
-                }:
-                    raise
-                invalid_reason = str(exc)
-            else:
-                if checked.is_revoked:
-                    invalid_reason = 'Telegram : is_revoked=True (lien révoqué)'
-
-            if invalid_reason:
-                replacement = await replace_invalid_campaign_link(bot, camp, invalid_reason) if repair else None
-                if replacement:
-                    camp.invite_link = replacement
-                    replaced = True
-                else:
-                    reason = invalid_reason
-            elif checked.invite_link != camp.invite_link:
-                reason = 'Telegram : URL retournée différente du lien conservé'
-            elif checked.expire_date or checked.member_limit or checked.creates_join_request:
-                reason = ('Telegram : paramètres illimités non confirmés : '
-                          f'expire_date={checked.expire_date}, '
-                          f'member_limit={checked.member_limit}, '
-                          f'creates_join_request={checked.creates_join_request}')
-        except RetryAfter as exc:
-            reason = f'{type(exc).__name__}: {exc}'
-            delay = exc.retry_after
-            if not isinstance(delay, timedelta):
-                delay = timedelta(seconds=float(delay))
-            _campaign_audit_retry_at = now() + delay + timedelta(seconds=1)
-            retry_later = True
-        except TelegramError as exc:
-            reason = f'{type(exc).__name__}: {exc}'
-    if repair:
-        await report_campaign_link_check(bot, camp, group, reason)
-    return ReferralCheck(link=camp.invite_link if reason is None else None,
-                         reason=reason, replaced=replaced, throttled=retry_later)
+        text = '⚠️ Ton lien de parrainage est temporairement indisponible. Réessaie avec le bouton ci-dessous.'
+    return text, referral_actions(result.link, menu)
 
 
 async def show_recent_referrals(message, bot, limit: int) -> None:
@@ -274,25 +112,24 @@ async def show_recent_referrals(message, bot, limit: int) -> None:
     async with _campaign_audit_lock:
         async with SessionLocal() as db:
             rows = (await db.execute(
-                select(Campaign, CampaignReferral.token, Group.title)
-                .outerjoin(CampaignReferral, CampaignReferral.campaign_id == Campaign.id)
+                select(Campaign, Group.title)
+                .outerjoin(CampaignInviteLink, CampaignInviteLink.invite_link == Campaign.invite_link)
                 .join(Group, Group.chat_id == Campaign.pub_group_id)
-                .order_by(func.coalesce(CampaignReferral.created_at, Campaign.created_at).desc(), Campaign.id.desc())
+                .order_by(func.coalesce(CampaignInviteLink.created_at, Campaign.created_at).desc(), Campaign.id.desc())
                 .limit(limit)
             )).all()
 
         lines = [f'<b>Parrainage · {len(rows)} lien(s) récent(s)</b>']
-        for campaign, token, group_title in rows:
-            result = await audit_campaign_link(bot, campaign, repair=False)
-            address = referrals.share_address(bot, token) if token else campaign.invite_link
-            label = 'Adresse du bot' if token else 'Invitation directe'
+        for campaign, group_title in rows:
+            result = await referrals.check_campaign_link(bot, campaign.id, replace_broken=False)
             status = '✅ Validé par Telegram'
             if result.throttled:
                 status = '⏳ Non vérifié · limite Telegram'
             elif result.reason:
                 status = f'⚠️ {escape(result.reason[:85])}'
+            address = result.link or campaign.invite_link
             lines.append(
-                f'<a href="{escape(address)}">{label}</a> · <code>{campaign.user_id}</code> · '
+                f'<a href="{escape(address)}">Invitation directe</a> · <code>{campaign.user_id}</code> · '
                 f'{escape(group_title[:30])}\n{status}'
             )
         if not rows:
@@ -513,7 +350,7 @@ async def _send_trial_link(message, bot, camp: Campaign, user_id: int) -> bool:
     return True
 
 
-async def open_referral(message, bot, user_id: int, referral_token: str) -> None:
+async def open_legacy_referral(message, bot, user_id: int, referral_token: str) -> None:
     async with SessionLocal() as db:
         campaign = await db.scalar(select(Campaign).join(CampaignReferral).where(
             CampaignReferral.token == referral_token,
@@ -525,7 +362,7 @@ async def open_referral(message, bot, user_id: int, referral_token: str) -> None
     if campaign.user_id == user_id:
         await message.reply_text('C’est ton lien de parrainage. Partage-le pour inviter quelqu’un.')
         return
-    result = await audit_campaign_link(bot, campaign, repair=True)
+    result = await referrals.check_campaign_link(bot, campaign.id, replace_broken=True)
     retry = [InlineKeyboardButton('🔄 Vérifier le lien du groupe', callback_data=f'u:refretry:{referral_token}')]
     if result.link is None:
         await message.reply_text('L’entrée est momentanément indisponible. Réessaie dans quelques instants.',
@@ -557,9 +394,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text('⛔ Tu n’as pas invité des personnes FR valides. Tu es banni.')
         return
 
-    if context.args and context.args[0].startswith(referrals.REFERRAL_PREFIX):
-        await open_referral(update.effective_message, context.bot, user.telegram_id,
-                            context.args[0][len(referrals.REFERRAL_PREFIX):])
+    if context.args and context.args[0].startswith(referrals.LEGACY_PREFIX):
+        await open_legacy_referral(update.effective_message, context.bot, user.telegram_id,
+                            context.args[0][len(referrals.LEGACY_PREFIX):])
         return
 
     camp = await active_campaign(user.telegram_id)
@@ -610,7 +447,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
             try:
-                ref = await create_permanent_campaign_link(context.bot, group.chat_id, user.telegram_id)
+                camp = await referrals.start_campaign(context.bot, group, user.telegram_id)
             except TelegramError as exc:
                 await update.message.reply_text('Impossible de préparer ton accès pour le moment.')
                 await notify_admins(
@@ -618,29 +455,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f'🚨 Création du lien de parrainage impossible pour {group.title}: {exc}',
                 )
                 return
-
-            async with SessionLocal() as sdb:
-                camp = Campaign(
-                    user_id=user.telegram_id,
-                    pub_group_id=group.chat_id,
-                    vip_group_id=group.vip_group_id,
-                    invite_link=ref.invite_link,
-                )
-                sdb.add(camp)
-                await sdb.flush()
-                sdb.add(CampaignInviteLink(
-                    campaign_id=camp.id, invite_link=ref.invite_link,
-                    is_current=True, created_at=now(), last_checked_at=now(),
-                ))
-                sdb.add(
-                    MetricEvent(
-                        event_type=EventType.campaign_started,
-                        pub_group_id=group.chat_id,
-                        ad_version=group.ad_version,
-                        user_id=user.telegram_id,
-                    )
-                )
-                await sdb.commit()
 
         if await active_session(user.telegram_id):
             await show_counter(update.effective_message, user.telegram_id)
@@ -734,7 +548,7 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if await challenges.handle_user_callback(q, context, data):
         return
     if data.startswith('u:refretry:'):
-        await open_referral(q.message, context.bot, uid, data.split(':', 2)[2])
+        await open_legacy_referral(q.message, context.bot, uid, data.split(':', 2)[2])
         return
     if data in ('u:rules', 'u:ranks'):
         async with SessionLocal() as db:
@@ -759,26 +573,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         async with SessionLocal() as s:
             user = await s.get(User, uid)
             group = await s.get(Group, group_id)
-            if not user or user.banned or not group or not group.vip_group_id:
+            if (not user or user.banned or not group or group.role != GroupRole.pub
+                    or not group.authorized or not group.vip_group_id):
                 await q.message.reply_text('Impossible de démarrer cette campagne.'); return
         ok, reason = await bot_rights(context.bot, group_id)
         if not ok:
             await q.message.reply_text(f'Le groupe PUB n’est pas opérationnel : {reason}.'); return
         try:
-            link = await create_permanent_campaign_link(context.bot, group_id, uid)
-        except TelegramError as exc:
-            await q.message.reply_text(f'Création du lien impossible : {exc}'); return
-        async with SessionLocal() as s:
-            camp = Campaign(user_id=uid, pub_group_id=group_id, vip_group_id=group.vip_group_id, invite_link=link.invite_link)
-            s.add(camp)
-            await s.flush()
-            s.add(CampaignInviteLink(
-                campaign_id=camp.id, invite_link=link.invite_link,
-                is_current=True, created_at=now(), last_checked_at=now(),
-            ))
-            s.add(MetricEvent(event_type=EventType.campaign_started, pub_group_id=group_id, ad_version=group.ad_version, user_id=uid))
-            await s.commit()
-        share_link = await referrals.share_url(context.bot, camp.id)
+            camp = await referrals.start_campaign(context.bot, group, uid)
+        except TelegramError:
+            await q.message.reply_text('Impossible de créer le lien de parrainage. Réessaie dans quelques instants.')
+            return
+        share_link = camp.invite_link
         await q.message.reply_text(
             f'✅ <b>Ton lien de parrainage est prêt</b>\n\n{referrals.clickable_url(share_link)}',
             parse_mode=ParseMode.HTML, disable_web_page_preview=True,
@@ -791,21 +597,10 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not camp:
             await q.message.reply_text('Aucune campagne active.')
             return
-        share_link = await referrals.share_url(context.bot, camp.id)
-        text = f'🔗 <b>Ton lien de parrainage</b>\n\n{referrals.clickable_url(share_link)}'
-        if data == 'u:checkref':
-            result = await audit_campaign_link(context.bot, camp, repair=True)
-            if result.replaced:
-                text += '\n\n✅ L’invitation au groupe a été réparée. Tu peux repartager ce même lien.'
-            elif result.link:
-                text += ('\n\n✅ Telegram accepte l’invitation au groupe. Si un invité a un problème, '
-                         'demande-lui de rouvrir ce lien dans le bot.')
-            elif result.throttled:
-                text += '\n\n⏳ Telegram limite les vérifications. Réessaie dans quelques instants.'
-            else:
-                text += '\n\n⚠️ Le bot n’a pas pu valider l’invitation. L’équipe peut vérifier l’erreur.'
+        result = await referrals.check_campaign_link(context.bot, camp.id, replace_broken=True)
+        text, actions = referral_message(result)
         await q.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-                                   reply_markup=referral_actions(share_link))
+                                   reply_markup=actions)
         return
     if data == 'u:counter':
         await show_counter(q.message, uid)
@@ -1445,7 +1240,8 @@ async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
                 sdb.add(MetricEvent(event_type=EventType.trial_kick, pub_group_id=camp.pub_group_id, user_id=trial.user_id))
                 missing = max(0, settings.minimum_minutes - available)
                 try:
-                    share_link = await referrals.share_url(context.bot, camp.id)
+                    result = await referrals.check_campaign_link(context.bot, camp.id, replace_broken=True)
+                    link_text, actions = referral_message(result, user_menu(False, missing))
                     await context.bot.send_message(
                         trial.user_id,
                         '⏳ <b>Ton accès découverte est terminé !</b>\n\n'
@@ -1461,11 +1257,10 @@ async def expire_trials(context: ContextTypes.DEFAULT_TYPE) -> None:
                         f'⏱ Crédit disponible : <b>{available} minute(s)</b>\n'
                         f'🎯 Encore <b>{missing}</b> minute(s) pour revenir dans le VIP.\n\n'
                         '━━━━━━━━━━━━━━\n'
-                        '🔗 <b>Ton lien personnel</b>\n\n'
-                        f'{referrals.clickable_url(share_link)}\n\n'
+                        f'{link_text}\n\n'
                         'Chaque personne validée te rapporte des minutes selon ton rang.',
                         parse_mode=ParseMode.HTML,
-                        reply_markup=referral_actions(share_link, user_menu(False, missing)),
+                        reply_markup=actions,
                         disable_web_page_preview=True,
                     )
                 except TelegramError:
@@ -1586,18 +1381,18 @@ async def expire_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
                 remaining = max(0, camp.minutes_earned - camp.minutes_consumed)
                 missing = max(0, settings.minimum_minutes - remaining)
                 try:
-                    share_link = await referrals.share_url(context.bot, camp.id)
+                    result = await referrals.check_campaign_link(context.bot, camp.id, replace_broken=True)
+                    link_text, actions = referral_message(result, user_menu(remaining >= settings.minimum_minutes, missing))
                     await context.bot.send_message(
                         session.user_id,
                         f'⌛ Ton temps VIP est terminé.\n\n'
                         f'Crédit disponible : {remaining} minute(s).\n'
                         f'Continue à inviter pour gagner de nouvelles minutes. '
                         f'Il faut au moins {settings.minimum_minutes} minutes pour revenir.\n\n'
-                        f'🔗 Ton lien de parrainage à partager\n{referrals.clickable_url(share_link)}',
+                        f'{link_text}',
                         parse_mode=ParseMode.HTML,
                         disable_web_page_preview=True,
-                        reply_markup=referral_actions(
-                            share_link, user_menu(remaining >= settings.minimum_minutes, missing)),
+                        reply_markup=actions,
                     )
                 except TelegramError:
                     pass

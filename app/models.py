@@ -125,18 +125,17 @@ class Campaign(Base):
 
 
 class CampaignReferral(Base):
+    """Jetons parrainage V6.1/V6.2, lus pour les adresses déjà partagées."""
     __tablename__ = 'campaign_referrals'
     campaign_id: Mapped[int] = mapped_column(Integer, ForeignKey('campaigns.id'), primary_key=True)
     token: Mapped[str] = mapped_column(String(32), unique=True)
-    created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class CampaignInviteLink(Base):
     """Historique des liens de parrainage d'une campagne.
 
-    On ne supprime pas les anciens liens lors d'une rotation : s'ils sont encore
-    utilisables et ont déjà été partagés, une arrivée via ces liens continue
-    d'être attribuée à la bonne campagne.
+    Les anciens liens et les arrivées reçues en retard restent attribuables
+    à la bonne campagne après le remplacement d'une invitation.
     """
     __tablename__ = 'campaign_invite_links'
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

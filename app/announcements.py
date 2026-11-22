@@ -8,9 +8,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 
 from .db import SessionLocal
-from .keyboards import referral_actions
 from .models import ReleaseNotice, ReleaseNoticeDelivery, User
-from .referrals import clickable_url, share_url
 from .services import active_campaign, now
 from .challenges import keyboard
 
@@ -64,14 +62,12 @@ async def deliver_notice_batch(context):
                 await db.commit()
                 uid = delivery.user_id
             camp = await active_campaign(uid)
-            text = ('🔗 <b>Ton lien de parrainage devient stable</b>\n\n'
-                    'Ton lien ouvre le bot, qui aide tes invités à rejoindre le groupe partenaire.\n'
+            text = ('🔗 <b>Ton lien de parrainage ouvre le groupe partenaire</b>\n\n'
                     'Tes minutes et tes invitations sont conservées.\n\n')
             menu = keyboard([[('📊 MON ESPACE', 'u:counter')], [('🏅 LES RANGS', 'u:ranks')]])
             if camp:
-                link = await share_url(context.bot, camp.id)
-                text += f'Voici ton lien à conserver\n{clickable_url(link)}\n\n'
-                menu = referral_actions(link, menu)
+                text += 'Appuie sur « Mon lien » pour récupérer ton invitation directe.\n\n'
+                menu = keyboard([[('🔗 MON LIEN', 'u:link')], [('📊 MON ESPACE', 'u:counter')]])
             else:
                 text += 'Pour reprendre, ouvre « VIP GRATUIT » depuis un groupe partenaire et obtiens ton lien personnel.\n\n'
             text += ('🏅 De nouveaux rangs récompensent tes invitations : Bronze, Silver, Gold, Platine et Omega.\n'

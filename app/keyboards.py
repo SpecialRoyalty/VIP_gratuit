@@ -24,12 +24,11 @@ def recent_referrals_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def referral_actions(link: str, menu: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
-    share = 'https://t.me/share/url?' + urlencode({'url': link})
-    rows = [
-        [InlineKeyboardButton('↗️ Partager mon lien', url=share)],
-        [InlineKeyboardButton('🛠 Mon lien ne marche pas', callback_data='u:checkref')],
-    ]
+def referral_actions(link: str | None, menu: InlineKeyboardMarkup | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton('🛠 Mon lien ne marche pas', callback_data='u:checkref')]]
+    if link:
+        share = 'https://t.me/share/url?' + urlencode({'url': link})
+        rows.insert(0, [InlineKeyboardButton('↗️ Partager mon lien', url=share)])
     return InlineKeyboardMarkup(rows + (list(menu.inline_keyboard) if menu else []))
 
 

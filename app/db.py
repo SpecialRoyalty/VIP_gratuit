@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -24,14 +23,6 @@ class Base(DeclarativeBase):
 
 
 async def init_db() -> None:
-    from .models import CampaignReferral
-
-    def create_schema(conn):
-        Base.metadata.create_all(conn)
-        table = CampaignReferral.__table__
-        if 'created_at' not in {col['name'] for col in inspect(conn).get_columns(table.name)}:
-            column_type = table.c.created_at.type.compile(dialect=conn.dialect)
-            conn.exec_driver_sql(f'ALTER TABLE {table.name} ADD COLUMN created_at {column_type}')
-
+    from . import models  # noqa: F401
     async with engine.begin() as conn:
-        await conn.run_sync(create_schema)
+        await conn.run_sync(Base.metadata.create_all)
