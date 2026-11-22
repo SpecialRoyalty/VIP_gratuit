@@ -1,3 +1,11 @@
+# V6.3 — Invitations directes vers le groupe partenaire
+
+- Les liens cliquables de **Mon lien** et de fin de VIP ouvrent directement le groupe PUB.
+- La création et le contrôle omettent les paramètres de quota et d'expiration. Le bot vérifie les restrictions réellement renvoyées par Telegram.
+- Le contrôle rétablit d'abord le lien existant. Le bot fournit une nouvelle URL uniquement si l'ancienne est confirmée inutilisable ou reste restreinte et que le parcours utilisateur demande son rétablissement.
+- Le panneau admin contrôle les 5, 10 ou 20 dernières invitations directes, sans remplacement dans ce panneau.
+- Les campagnes, crédits et historiques existants sont repris. Les anciennes adresses du bot restent compatibles si leur base est conservée.
+
 # V6.2 — Partage et diagnostic des liens
 
 - Liens cliquables dans le bot et bouton de partage Telegram.

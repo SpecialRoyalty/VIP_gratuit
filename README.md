@@ -1,6 +1,6 @@
-# Bot Telegram VIP — V6.2
+# Bot Telegram VIP — V6.3
 
-Liens de parrainage permanents, minutes selon le rang et défi facultatif VIP à vie, avec validation administrateur.
+Invitations directes vers les groupes partenaires, minutes selon le rang et défi facultatif VIP à vie, avec validation administrateur.
 
 ## Redémarrer avec une base vide
 
@@ -14,7 +14,7 @@ Les anciennes campagnes, minutes, invitations, configurations et décisions VIP 
 
 ### Mettre à jour en conservant les données
 
-Déployer avec la même `DATABASE_URL`. Le bot crée la table `campaign_referrals` ou ajoute sa colonne de date au démarrage. Les comptes, campagnes, crédits et décisions existants sont conservés. Les utilisateurs obtiennent leur nouvelle adresse stable avec **MON LIEN**. Les anciennes invitations directes encore valides restent attribuées à leur campagne.
+Déployer avec le même `BOT_TOKEN` et la même `DATABASE_URL`. Les campagnes, compteurs, crédits et décisions VIP à vie sont conservés. Ouvrir **MON LIEN** pour récupérer l'invitation directe. Le bot vérifie le lien déjà enregistré et tente de retirer ses restrictions en conservant l'URL. Le menu **VÉRIFIER LES LIENS RÉCENTS** permet de contrôler un lot après la mise à jour.
 
 ## Barème des rangs
 
@@ -37,10 +37,10 @@ Les rangs sont automatiques, indépendants du défi. Omega donne 5 minutes par i
 ## Parcours habituel
 
 1. L'administrateur publie une publicité dans un groupe PUB avec le bouton **VIP GRATUIT**.
-2. Le bot crée une campagne et une adresse de parrainage qui ouvre le bot. Une seule campagne est active par personne.
+2. Le bot crée une campagne et une invitation directe au groupe PUB. Une seule campagne est active par personne.
 3. Une découverte du VIP est proposée une seule fois. Ses 2 minutes par défaut commencent lors de l'entrée réelle.
 4. À la fin de l'essai, le bot expulse l'utilisateur puis lui présente le fonctionnement et son lien. Si le crédit atteint déjà le minimum, il convertit l'essai en session normale **avant toute expulsion**.
-5. L'invité ouvre le lien partagé, appuie sur **Démarrer** et utilise le bouton **REJOINDRE LE GROUPE**. Il doit rester dans le PUB au moins 5 minutes par défaut pour que l'invitation soit validée. Les auto-invitations, doublons et bots ne donnent pas de crédit ; le filtre de profils existant reste en place.
+5. L'invité ouvre l'invitation partagée et rejoint directement le groupe PUB. Il doit rester dans ce groupe au moins 5 minutes par défaut pour que l'invitation soit validée. Les auto-invitations, doublons et bots ne donnent pas de crédit ; le filtre de profils existant reste en place.
 6. Chaque invitation validée rapporte 1 à 5 minutes selon le rang.
 7. À partir de 10 minutes disponibles par défaut, l'utilisateur peut demander un lien personnel vers le VIP. Le compte à rebours commence à son entrée réelle.
 8. Les invitations validées pendant une session prolongent celle-ci du nombre de minutes correspondant au rang, sans créditer deux fois les mêmes minutes.
@@ -78,7 +78,7 @@ Si le groupe PUB de la campagne disparaît, un défi non approuvé est annulé. 
 
 ## Annonce unique au premier déploiement V6
 
-La liste des utilisateurs déjà enregistrés au premier démarrage V6 est figée en base. Le bot leur annonce les liens stables, la conservation des compteurs, les rangs et le défi facultatif. Il joint le lien actuel lorsqu'une campagne active existe ; sinon il indique comment reprendre depuis un groupe partenaire.
+La liste des utilisateurs déjà enregistrés au premier démarrage V6 est figée en base. Le bot leur annonce les liens stables, la conservation des compteurs, les rangs et le défi facultatif. Il propose le bouton **MON LIEN** lorsqu’une campagne active existe ; sinon il indique comment reprendre depuis un groupe partenaire.
 
 - Les envois commencent environ 45 secondes après démarrage, par lots de 25 par minute.
 - Le statut de chaque envoi est enregistré : un redémarrage ou un nouveau push ne relance pas les messages déjà envoyés.
@@ -90,13 +90,19 @@ La liste des utilisateurs déjà enregistrés au premier démarrage V6 est figé
 
 ## Partager et vérifier un lien de parrainage
 
-**MON LIEN** et les messages de fin de VIP affichent la même adresse cliquable du bot, avec **Partager mon lien** et **Mon lien ne marche pas**. Ce dernier bouton teste l'invitation au groupe et affiche le résultat. L'invité peut aussi vérifier le lien depuis le bouton proposé par le bot après **Démarrer**.
+**MON LIEN** et les messages de fin de VIP affichent une invitation Telegram cliquable du type `https://t.me/+…` vers le groupe partenaire. **Partager mon lien** transmet cette invitation directe. Le lien est créé sans expiration, sans quota de membres et sans demande d'adhésion.
 
-Quand Telegram confirme que l'invitation au groupe PUB est invalide, le bot la remplace à la demande, tout en conservant l'adresse de parrainage et son attribution. Une panne réseau, une limite Telegram ou une erreur de droits ne déclenche pas de remplacement.
+Le contrôle envoie une édition à Telegram en omettant le quota et l'expiration. Envoyer `member_limit=0` explicitement est hors de la plage documentée par l’API Bot et le contrôle précédent a pu recevoir `member_limit=1`. Le contrôle vérifie les propriétés renvoyées par Telegram et conserve la même URL si elles sont correctes. Si Telegram confirme un lien invalide, ou s'il renvoie encore des restrictions, le bot peut fournir un nouveau lien quand le parrain le récupère ou clique sur **Mon lien ne marche pas**. Une panne réseau, une limite de requêtes ou une erreur de droits ne suffit pas à remplacer un lien.
 
-Depuis le panneau admin, **VÉRIFIER LES LIENS RÉCENTS** contrôle les 10 derniers liens. Les boutons permettent de contrôler les 5, 10 ou 20 derniers. Le rapport affiche le lien cliquable, l'identifiant du parrain, le groupe et le résultat Telegram. La vérification admin ne remplace aucun lien. Pour les campagnes dont la date d'émission du lien est inconnue, le classement utilise la date de création de la campagne. Les contrôles périodiques et au démarrage ont été retirés.
+**VÉRIFIER LES LIENS RÉCENTS** contrôle à la demande les 5, 10 ou 20 dernières invitations directes, sans en créer de nouvelles. Telegram peut révoquer une URL directe. Si elle est remplacée, le parrain doit partager la nouvelle adresse. L'historique conserve l'attribution des invitations effectuées via d'anciens liens.
 
-Un résultat positif confirme que Telegram accepte l'invitation lors du contrôle. L'accès peut dépendre du compte invité et de l'état du groupe. Les invitations d'entrée dans le VIP conservent la durée définie par `VIP_LINK_TTL_MINUTES`.
+Les adresses `?start=ref_…` déjà partagées en V6.1/V6.2 restent reconnues si la base d'origine est conservée. Les messages de parrainage nouveaux affichent l'invitation directe. Les liens d'entrée **dans le VIP** utilisent toujours leur durée définie par `VIP_LINK_TTL_MINUTES`.
+
+### Vérification dans Telegram après déploiement
+
+1. Ouvrir **MON LIEN** dans le bot et copier l'URL directe. Si le groupe le permet, vérifier dans la liste des invitations Telegram que l'URL a une validité illimitée et aucune limite d'utilisation.
+2. Utiliser cette même URL depuis deux comptes qui ne sont pas membres du groupe PUB. Vérifier que les deux comptes entrent et que les invitations sont créditées après le délai de validation.
+3. Dans le panneau admin, vérifier le résultat du contrôle de cette invitation.
 
 ## Configuration et administration
 
@@ -125,4 +131,4 @@ pip install aiosqlite
 python -m unittest discover -s tests -v
 ```
 
-Les tests exercent le démarrage sur une base SQLite en mémoire avec Telegram simulé, l'envoi du lien après la découverte VIP, le remplacement d'une invitation invalide, l'attribution et le calcul des minutes.
+Les tests exercent le démarrage sur une base SQLite en mémoire avec Telegram simulé, l'envoi du lien après la découverte VIP, les paramètres effectivement envoyés par le client Bot API, la réparation d'un quota sur la même URL, le remplacement ciblé, l'attribution et le calcul des minutes.
