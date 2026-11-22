@@ -1,16 +1,20 @@
-# Bot Telegram VIP — V6.0
+# Bot Telegram VIP — V6.2
 
 Liens de parrainage permanents, minutes selon le rang et défi facultatif VIP à vie, avec validation administrateur.
 
-## Mise à jour depuis V5.4 ou V5.5
+## Redémarrer avec une base vide
 
-1. Remplacer l'ancien code par le contenu de cette archive et redéployer.
-2. Conserver le même `BOT_TOKEN`, les mêmes `OWNER_IDS` et la même `DATABASE_URL`. Ne pas recréer ni vider la base.
-3. Arrêter l'ancienne instance lors du redéploiement. Une seule instance du bot doit fonctionner ; les envois et les décisions sont conçus pour ce mode.
-4. Les cinq nouvelles tables sont créées automatiquement au démarrage : `challenge_enrollments`, `challenge_evidence`, `lifetime_accesses`, `release_notices`, `release_notice_deliveries`. Aucun changement de colonne ou d'enum existant n'est requis depuis V5.4/V5.5.
-5. Les anciennes variables `CAMPAIGN_LINK_MAX_AGE_HOURS`, `CAMPAIGN_LINK_REFRESH_MINUTES` et `CAMPAIGN_LINK_ROTATION_BATCH` sont ignorées et peuvent être supprimées.
+1. Créer une nouvelle base PostgreSQL et conserver l'ancienne base ou une sauvegarde avant la bascule. Le bot crée ses tables au démarrage.
+2. Renseigner `DATABASE_URL` avec l'adresse de la nouvelle base. Conserver `BOT_TOKEN` et `OWNER_IDS` si le bot et les propriétaires restent les mêmes. Arrêter l'ancienne instance avant de démarrer la nouvelle.
+3. Avec un compte propriétaire, ouvrir `/start` en privé. Si le bot fait déjà partie des groupes à reprendre, le retirer puis le réajouter pour que la nouvelle base détecte ces groupes. Lui redonner ses droits d'administration.
+4. Classer les groupes en PUB/VIP, refaire les associations et republier les annonces. Les anciens boutons de campagne doivent être remplacés.
+5. Tester avec un parrain et un invité distincts. Après l'essai VIP, ouvrir le lien du parrain avec le compte invité, rejoindre le groupe PUB et vérifier le crédit après le délai de validation.
 
-Les utilisateurs, liens, minutes, invitations et campagnes existants sont conservés. Le déploiement lance l'annonce unique décrite ci-dessous. Le ZIP n'exécute rien tant qu'il n'est pas déployé.
+Les anciennes campagnes, minutes, invitations, configurations et décisions VIP à vie restent dans l'ancienne base. Pour éviter de laisser circuler des invitations directes de l'ancien système, les retirer dans Telegram lors de la bascule. Une base neuve ne révoque pas ces invitations chez Telegram.
+
+### Mettre à jour en conservant les données
+
+Déployer avec la même `DATABASE_URL`. Le bot crée la table `campaign_referrals` ou ajoute sa colonne de date au démarrage. Les comptes, campagnes, crédits et décisions existants sont conservés. Les utilisateurs obtiennent leur nouvelle adresse stable avec **MON LIEN**. Les anciennes invitations directes encore valides restent attribuées à leur campagne.
 
 ## Barème des rangs
 
@@ -33,10 +37,10 @@ Les rangs sont automatiques, indépendants du défi. Omega donne 5 minutes par i
 ## Parcours habituel
 
 1. L'administrateur publie une publicité dans un groupe PUB avec le bouton **VIP GRATUIT**.
-2. Le bot crée une campagne et un lien de parrainage vers ce groupe. Une seule campagne est active par personne.
+2. Le bot crée une campagne et une adresse de parrainage qui ouvre le bot. Une seule campagne est active par personne.
 3. Une découverte du VIP est proposée une seule fois. Ses 2 minutes par défaut commencent lors de l'entrée réelle.
 4. À la fin de l'essai, le bot expulse l'utilisateur puis lui présente le fonctionnement et son lien. Si le crédit atteint déjà le minimum, il convertit l'essai en session normale **avant toute expulsion**.
-5. Une nouvelle personne rejoignant le PUB via le lien doit rester au moins 5 minutes par défaut pour que l'invitation soit validée. Les auto-invitations, doublons et bots ne donnent pas de crédit ; le filtre de profils existant reste en place.
+5. L'invité ouvre le lien partagé, appuie sur **Démarrer** et utilise le bouton **REJOINDRE LE GROUPE**. Il doit rester dans le PUB au moins 5 minutes par défaut pour que l'invitation soit validée. Les auto-invitations, doublons et bots ne donnent pas de crédit ; le filtre de profils existant reste en place.
 6. Chaque invitation validée rapporte 1 à 5 minutes selon le rang.
 7. À partir de 10 minutes disponibles par défaut, l'utilisateur peut demander un lien personnel vers le VIP. Le compte à rebours commence à son entrée réelle.
 8. Les invitations validées pendant une session prolongent celle-ci du nombre de minutes correspondant au rang, sans créditer deux fois les mêmes minutes.
@@ -84,19 +88,15 @@ La liste des utilisateurs déjà enregistrés au premier démarrage V6 est figé
 - Les limites Telegram reportent toute la file jusqu'à l'échéance indiquée.
 - **BILAN ANNONCE** affiche les nombres envoyés, en attente, en cours, en échec et incertains.
 
-## Liens de parrainage permanents et contrôles silencieux
+## Partager et vérifier un lien de parrainage
 
-Les liens de parrainage PUB sont créés sans expiration ni quota de membres. Aucun renouvellement n'est déclenché par leur âge, par **MON LIEN**, par le démarrage ou par une erreur d'audit. Les anciennes URL partagées continuent d'attribuer les invitations à la même campagne.
+**MON LIEN** et les messages de fin de VIP affichent la même adresse cliquable du bot, avec **Partager mon lien** et **Mon lien ne marche pas**. Ce dernier bouton teste l'invitation au groupe et affiche le résultat. L'invité peut aussi vérifier le lien depuis le bouton proposé par le bot après **Démarrer**.
 
-L'audit vérifie le lien courant en éditant ses paramètres sans changer son URL, avec `expire_date=0`, `member_limit=0` et sans demande d'adhésion. La Bot API ne propose pas de test de clic ; un contrôle réussi ne garantit pas l'accès d'une personne particulière.
+Quand Telegram confirme que l'invitation au groupe PUB est invalide, le bot la remplace à la demande, tout en conservant l'adresse de parrainage et son attribution. Une panne réseau, une limite Telegram ou une erreur de droits ne déclenche pas de remplacement.
 
-- En cas de réussite : aucun message.
-- En cas d'échec : alerte réservée aux administrateurs avec groupe, utilisateur, lien et erreur exacte. Aucun remplacement ni message à l'utilisateur.
-- Même erreur : rappel au plus une fois par 24 heures, avec déduplication persistante. Un changement d'erreur ou une nouvelle panne après rétablissement peut déclencher une alerte.
-- **AUDITER LES LIENS** lance le même contrôle. Les anciens boutons de renouvellement ne peuvent plus changer les liens.
-- Une simple perte de droits ne clôture plus la campagne. Un groupe réellement perdu ou supprimé manuellement peut toujours entraîner sa clôture et la révocation des liens associés.
+Depuis le panneau admin, **VÉRIFIER LES LIENS RÉCENTS** contrôle les 10 derniers liens. Les boutons permettent de contrôler les 5, 10 ou 20 derniers. Le rapport affiche le lien cliquable, l'identifiant du parrain, le groupe et le résultat Telegram. La vérification admin ne remplace aucun lien. Pour les campagnes dont la date d'émission du lien est inconnue, le classement utilise la date de création de la campagne. Les contrôles périodiques et au démarrage ont été retirés.
 
-Un lien sans expiration peut toujours devenir inutilisable après une révocation manuelle ou la disparition du groupe.
+Un résultat positif confirme que Telegram accepte l'invitation lors du contrôle. L'accès peut dépendre du compte invité et de l'état du groupe. Les invitations d'entrée dans le VIP conservent la durée définie par `VIP_LINK_TTL_MINUTES`.
 
 ## Configuration et administration
 
@@ -109,8 +109,6 @@ Voir `env.example` pour les paramètres. Les variables obligatoires sont `BOT_TO
 | `TRIAL_MINUTES` | 2 | Découverte VIP |
 | `VIP_LINK_TTL_MINUTES` | 15 | Validité des liens personnels d'entrée VIP |
 | `KICK_RETRY_SECONDS` | 20 | Vérification des sorties dues |
-| `CAMPAIGN_LINK_AUDIT_MINUTES` | 10 | Fréquence des audits de liens PUB |
-| `CAMPAIGN_LINK_AUDIT_BATCH` | 100 | Taille des lots d'audit |
 | `GROUP_LOST_GRACE_MINUTES` | 10 | Délai de réconciliation des groupes perdus |
 
 Le bot doit être administrateur des groupes, avec les droits d'invitation et de restriction ; le VIP nécessite aussi le droit de suppression des messages. Le bot supprime les notifications de service d'entrée/sortie dans les VIP.
@@ -118,14 +116,6 @@ Le bot doit être administrateur des groupes, avec les droits d'invitation et de
 Le panneau conserve la gestion des groupes, les publicités avec image, les statistiques, les mots interdits, le broadcast privé avec confirmation, les contrôles de santé et les opérations de désactivation/suppression de groupes.
 
 Le filtre de noms et pseudos ne prouve ni la nationalité d'une personne ni sa provenance Discord/Leakmedia.
-
-## Installation neuve
-
-1. Préparer une base PostgreSQL et renseigner les variables de `env.example` sur l'hébergement.
-2. Installer `requirements.txt` et lancer `python -m app.main` (ou utiliser le Dockerfile/Procfile fourni).
-3. Ajouter le bot aux groupes et lui donner les droits requis.
-4. Ouvrir `/start` en privé avec un compte présent dans `OWNER_IDS`.
-5. Classer les groupes en PUB/VIP, associer chaque PUB à un VIP, configurer la publicité et publier.
 
 ## Vérifications hors ligne
 
@@ -135,4 +125,4 @@ pip install aiosqlite
 python -m unittest discover -s tests -v
 ```
 
-Les tests utilisent un bot simulé et une base SQLite en mémoire, jamais Telegram ni la base de production. Ils couvrent les liens stables, les rangs et leurs seuils, les bonus de session, l'inscription volontaire, les arrivées tardives, les décisions admin, les droits permanents, les expulsions et les envois uniques. Les verrous PostgreSQL et la remise réelle de messages restent à observer après déploiement.
+Les tests exercent le démarrage sur une base SQLite en mémoire avec Telegram simulé, l'envoi du lien après la découverte VIP, le remplacement d'une invitation invalide, l'attribution et le calcul des minutes.

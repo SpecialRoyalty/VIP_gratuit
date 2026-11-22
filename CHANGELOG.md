@@ -1,3 +1,17 @@
+# V6.2 — Partage et diagnostic des liens
+
+- Liens cliquables dans le bot et bouton de partage Telegram.
+- Bouton **Mon lien ne marche pas** avec résultat du contrôle et réparation ciblée si Telegram rejette définitivement l'invitation.
+- Écran admin avec contrôle à la demande des 5, 10 ou 20 liens les plus récents. Suppression des contrôles périodiques et au démarrage.
+- Nouvelles barres de progression avec pourcentage pour le rang et le défi VIP à vie.
+
+# V6.1 — Adresses de parrainage stables
+
+- **Mon lien** et les messages de fin de VIP partagent désormais une adresse du bot propre à chaque campagne.
+- À l’ouverture ou lors d’un audit, le bot vérifie l’invitation du groupe PUB. Il la remplace si Telegram confirme qu’elle est invalide, sans changer l’adresse de parrainage.
+- Les anciennes invitations encore utilisables restent attribuées à leur campagne si la base est conservée.
+- Le démarrage initialise automatiquement une base PostgreSQL vide et les comptes propriétaires.
+
 # V6.0 — Rangs et défi VIP à vie
 
 - Bronze 0 / Silver 50 / Gold 150 / Platine 300 / Omega 500 : de 1 à 5 minutes par nouvelle invitation validée.
